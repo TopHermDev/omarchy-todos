@@ -56,6 +56,12 @@ After installing, run once to make sure the widget's IPC handler registers clean
 omarchy restart shell
 ```
 
+## Removal
+
+```bash
+omarchy plugin remove jeanhuit.todos
+```
+
 ## Configuration
 
 Set the vault path by clicking the widget and pasting it into the setup form,
