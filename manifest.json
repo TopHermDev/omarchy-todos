@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "id": "jeanhuit.todos",
+  "name": "Synced Todos",
+  "version": "1.0.0",
+  "author": "jeanhuit",
+  "license": "MIT",
+  "description": "Obsidian-tasks todo list backed by markdown in a Syncthing-synced Obsidian vault.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Todos",
+    "description": "Todo list backed by Obsidian markdown in a Syncthing-synced vault.",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "vaultPath": "",
+      "todosDir": "Todos",
+      "inboxFile": "inbox.md",
+      "showCompleted": false
+    },
+    "schema": [
+      {
+        "key": "vaultPath",
+        "type": "path",
+        "label": "Obsidian vault",
+        "defaultValue": "",
+        "description": "Absolute path to your Obsidian vault folder, synced by Syncthing."
+      },
+      {
+        "key": "todosDir",
+        "type": "string",
+        "label": "Todos folder",
+        "defaultValue": "Todos",
+        "description": "Subfolder inside the vault holding your todo .md files."
+      },
+      {
+        "key": "inboxFile",
+        "type": "string",
+        "label": "Inbox file",
+        "defaultValue": "inbox.md",
+        "description": "Markdown file that quick-add appends new tasks to."
+      },
+      {
+        "key": "showCompleted",
+        "type": "boolean",
+        "label": "Show completed",
+        "defaultValue": false,
+        "description": "Also list completed tasks in the panel."
+      }
+    ]
+  }
+}
