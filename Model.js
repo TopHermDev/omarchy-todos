@@ -4,12 +4,25 @@
 var CHECKBOX = /^(\s*[-*]\s+\[)([ xX])(\]\s+)(.*)$/
 var DUE = /📅\s*(\d{4}-\d{2}-\d{2})/
 
+// Resource bounds. The vault is populated by sync tools, so a peer can drop
+// arbitrarily large files or many files into it. Cap how much we parse and
+// retain so a synced peer cannot exhaust the long-lived shell.
+var MAX_PARSE_CHARS = 512 * 1024
+var MAX_PARSE_LINES = 10000
+var MAX_TASKS = 1000
+
 function parseTasks(markdown) {
-  var lines = String(markdown || "").split(/\r?\n/)
+  var text = String(markdown || "")
+  if (text.length > MAX_PARSE_CHARS) text = text.slice(0, MAX_PARSE_CHARS)
+  var lines = text.split(/\r?\n/)
   var tasks = []
-  for (var i = 0; i < lines.length; i++) {
+  var n = lines.length < MAX_PARSE_LINES ? lines.length : MAX_PARSE_LINES
+  for (var i = 0; i < n; i++) {
     var t = parseTaskLine(lines[i], i)
-    if (t) tasks.push(t)
+    if (t) {
+      tasks.push(t)
+      if (tasks.length >= MAX_TASKS) break
+    }
   }
   return tasks
 }

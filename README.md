@@ -99,6 +99,19 @@ checkbox syntax. Any `.md` file under `todosDir` is scanned:
 - `📅 YYYY-MM-DD` sets a due date (overdue items render red in the popup).
 - Tasks are grouped per file and sorted: open before done, overdue first.
 
+## Resource limits
+
+Because the vault is populated by sync tools, a peer could in principle drop
+many files or very large files into it. To keep the long-lived shell safe, the
+plugin caps what it watches and parses:
+
+- Up to `256` markdown files are watched (alphabetically first).
+- Each file is parsed for up to `512 KB` / `10 000` lines, retaining at most
+  `1000` tasks per file.
+
+Tasks beyond those limits are simply not shown; the underlying files are never
+truncated or rewritten.
+
 ## Usage
 
 - **Bar** — shows the open count; `✓` when all clear, `!` when unconfigured.

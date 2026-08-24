@@ -34,6 +34,11 @@ Panel {
   property var views: ({})
   property string filesKey: ""
 
+  // Cap how many markdown files we watch. The vault is populated by sync
+  // tools, so a peer can drop arbitrarily many files into it; without a cap
+  // each one becomes a FileView and a retained parse result.
+  readonly property int maxFiles: 256
+
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
@@ -77,7 +82,7 @@ Panel {
   function setFile(name, path, content) {
     var next = {}
     for (var k in fileData) next[k] = fileData[k]
-    next[name] = { path: path, content: String(content || ""), tasks: Model.parseTasks(content) }
+    next[name] = { path: path, tasks: Model.parseTasks(content) }
     fileData = next
     recompute()
   }
@@ -114,6 +119,7 @@ Panel {
       if (names.indexOf(n) === -1) names.push(n)
     }
     names.sort()
+    if (names.length > root.maxFiles) names = names.slice(0, root.maxFiles)
 
     var key = names.join("\u0001")
     if (key === filesKey) return
