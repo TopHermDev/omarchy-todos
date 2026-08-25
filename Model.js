@@ -10,6 +10,7 @@ var DUE = /📅\s*(\d{4}-\d{2}-\d{2})/
 var MAX_PARSE_CHARS = 512 * 1024
 var MAX_PARSE_LINES = 10000
 var MAX_TASKS = 1000
+var MAX_TASK_CHARS = 2000
 
 function parseTasks(markdown) {
   var text = String(markdown || "")
@@ -87,6 +88,25 @@ function isOverdue(due, today) {
   return due !== "" && due < today
 }
 
+// Reduce a user-supplied setting to a single safe directory/file name. Strips
+// path separators and control characters, then leading dots and dashes so the
+// result can't be absolute, hidden, a parent reference (".."), or a command
+// option ("-"). Falls back when nothing safe remains.
+function sanitizeComponent(value, fallback) {
+  var s = String(value == null ? "" : value).trim()
+  s = s.replace(/[\\\/\x00-\x1f]+/g, "")
+  s = s.replace(/^[.\-]+/, "")
+  if (s === "") s = fallback
+  return s
+}
+
+// Bound the length of a single task before it is written to disk.
+function truncateTaskText(text) {
+  var s = String(text == null ? "" : text)
+  if (s.length > MAX_TASK_CHARS) s = s.slice(0, MAX_TASK_CHARS)
+  return s
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     parseTasks: parseTasks,
@@ -97,6 +117,8 @@ if (typeof module !== "undefined") {
     toggleTaskIn: toggleTaskIn,
     appendTask: appendTask,
     dateKey: dateKey,
-    isOverdue: isOverdue
+    isOverdue: isOverdue,
+    sanitizeComponent: sanitizeComponent,
+    truncateTaskText: truncateTaskText
   }
 }

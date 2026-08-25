@@ -12,14 +12,14 @@ Panel {
   ipcTarget: "jeanhuit.todos"
   manageIpc: false
 
-  readonly property string vaultPath: setting("vaultPath", "")
-  readonly property string todosDirName: setting("todosDir", "Todos")
-  readonly property string inboxFile: setting("inboxFile", "inbox.md")
+  readonly property string vaultPath: root.canonicalizeVault(setting("vaultPath", ""))
+  readonly property string todosDirName: Model.sanitizeComponent(setting("todosDir", "Todos"), "Todos")
+  readonly property string inboxFile: Model.sanitizeComponent(setting("inboxFile", "inbox.md"), "inbox.md")
   readonly property bool showCompleted: setting("showCompleted", false) === true
 
-  readonly property bool configured: String(vaultPath).trim() !== ""
-  readonly property string todosPath: String(vaultPath).trim() + "/" + String(todosDirName).trim()
-  readonly property string vaultName: configured ? String(vaultPath).replace(/\/+$/, "").split("/").pop() : ""
+  readonly property bool configured: vaultPath !== ""
+  readonly property string todosPath: vaultPath + "/" + todosDirName
+  readonly property string vaultName: configured ? vaultPath.replace(/\/+$/, "").split("/").pop() : ""
 
   readonly property color contentForeground: root.barForeground
   readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
@@ -38,6 +38,9 @@ Panel {
   // tools, so a peer can drop arbitrarily many files into it; without a cap
   // each one becomes a FileView and a retained parse result.
   readonly property int maxFiles: 256
+  // Cap the size of each file we read. Files at or above this size are not
+  // listed, so FileView never materializes an unboundedly large file.
+  readonly property int maxFileBytes: 262144
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -45,6 +48,22 @@ Panel {
   readonly property var openTasks: displayList.filter(function (t) { return !t.done })
   readonly property var doneTasks: displayList.filter(function (t) { return t.done })
   readonly property int doneCount: doneTasks.length
+
+  // Expand "~" and strip trailing slashes, and require an absolute path so the
+  // vault can never resolve relative to an unpredictable working directory or
+  // start with "-" (which find would treat as an option).
+  function canonicalizeVault(path) {
+    var p = String(path == null ? "" : path).trim()
+    if (p === "") return ""
+    if (p === "~" || p.slice(0, 2) === "~/") {
+      var home = Quickshell.env("HOME")
+      if (typeof home !== "string" || home === "") return ""
+      p = p === "~" ? home : home + p.slice(1)
+    }
+    p = p.replace(/\/+$/, "")
+    if (p === "" || p.charAt(0) !== "/") return ""
+    return p
+  }
 
   function recompute() {
     var list = []
@@ -106,7 +125,7 @@ Panel {
       openCount = 0
       return
     }
-    listProc.command = ["find", root.todosPath, "-maxdepth", "1", "-type", "f", "-name", "*.md", "-printf", "%f\\n"]
+    listProc.command = ["find", "-P", root.todosPath, "-maxdepth", "1", "-type", "f", "-size", "-" + root.maxFileBytes + "c", "-name", "*.md", "-printf", "%f\\n"]
     listProc.running = true
   }
 
@@ -145,7 +164,8 @@ Panel {
   }
 
   function addTask(text) {
-    var t = String(text || "").replace(/^\s+|\s+$/g, "").replace(/\r?\n/g, " ")
+    var t = String(text || "").replace(/\r?\n/g, " ").replace(/^\s+|\s+$/g, "")
+    t = Model.truncateTaskText(t)
     if (!root.configured || t === "") return
     addProc.run("- [ ] " + t, root.todosPath + "/" + root.inboxFile)
   }
@@ -450,6 +470,7 @@ Panel {
           Text {
             width: parent.width
             text: modelData.text
+            textFormat: Text.PlainText
             color: row.done
               ? Qt.darker(root.contentForeground, 1.8)
               : (row.overdue ? root.urgentColor : root.contentForeground)
@@ -463,6 +484,7 @@ Panel {
             visible: modelData.due !== ""
             width: parent.width
             text: "📅 " + modelData.due
+            textFormat: Text.PlainText
             color: row.overdue ? root.urgentColor : Qt.darker(root.contentForeground, 1.5)
             font.family: root.contentFontFamily
             font.pixelSize: Style.font.caption

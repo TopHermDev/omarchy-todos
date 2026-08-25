@@ -103,14 +103,24 @@ checkbox syntax. Any `.md` file under `todosDir` is scanned:
 
 Because the vault is populated by sync tools, a peer could in principle drop
 many files or very large files into it. To keep the long-lived shell safe, the
-plugin caps what it watches and parses:
+plugin bounds what it reads, watches, and parses:
 
 - Up to `256` markdown files are watched (alphabetically first).
-- Each file is parsed for up to `512 KB` / `10 000` lines, retaining at most
-  `1000` tasks per file.
+- Files at or above `256 KiB` are not read at all — `find` excludes them before
+  any content reaches the shell.
+- Each file is parsed for at most `10 000` lines / `1000` tasks (the `512 KB`
+  parse cap remains as defense in depth).
+- A single task added via the bar or IPC is truncated to `2000` characters.
 
 Tasks beyond those limits are simply not shown; the underlying files are never
 truncated or rewritten.
+
+## Path safety
+
+`todosDir` and `inboxFile` are treated as a single safe directory/file name:
+path separators, control characters, and leading dots/dashes are stripped, so a
+setting like `../../.config` can never escape the vault. The vault path itself
+is canonicalized (`~` expanded, trailing slashes removed) and must be absolute.
 
 ## Usage
 
