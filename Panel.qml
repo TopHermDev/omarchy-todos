@@ -192,6 +192,10 @@ Panel {
     scanCapped = false
     statusText = ""
     pendingFiles = []
+    // Stop any in-flight enumeration first: its entries would otherwise be
+    // validated against the NEW todosPath and its stderr could abort THIS
+    // scan. Dropping the connection also discards cross-generation output.
+    if (listProc.running) listProc.running = false
     listProc.command = ["find", todosPath, "-maxdepth", "1", "-type", "f", "-name", "*.md", "-print0"]
     listProc.running = true
   }
@@ -286,8 +290,10 @@ Panel {
   }
 
   function addTask(text) {
-    var t = String(text || "").replace(/^\s+|\s+$/g, "").replace(/[\r\n]+/g, " ")
-    if (!root.configured || vaultPending || todosPath === "" || t === "") return
+    // IPC/UI input is unbounded and can embed newlines (which would forge
+    // extra task lines in the file): flatten, collapse, and cap it first.
+    var t = Model.sanitizeTaskText(text, Model.MAX_TASK_LENGTH)
+    if (!root.configured || vaultPending || todosPath === "" || t === null) return
     var line = "- [ ] " + t
     var path = todosPath + "/" + inboxFile
     // Preferred write path: no shell at all. appendTask + setText goes
@@ -377,6 +383,29 @@ Panel {
     }
   }
 
+  // --- stat serialization ----------------------------------------------
+  // statProc is a single reusable Process, so candidates are validated
+  // strictly one at a time through this queue. Running a second stat while
+  // one is in flight would overwrite name/gen and misattribute or lose
+  // results.
+  property var statQueue: []
+  function statRequest(name, path, mode, gen) {
+    // Coalesce: only the latest request per file+mode is kept, so a rapid
+    // stream of file-changed events cannot grow the queue without bound
+    // (intermediate reloads would be redundant anyway).
+    var key = mode + "\u0001" + name
+    for (var i = 0; i < statQueue.length; i++) {
+      if (statQueue[i].key === key) { statQueue.splice(i, 1); break }
+    }
+    statQueue.push({ key: key, name: name, path: path, mode: mode, gen: gen })
+    statPump()
+  }
+  function statPump() {
+    if (statProc.running || statQueue.length === 0) return
+    var req = statQueue.shift()
+    statProc.run(req.name, req.path, req.mode, req.gen)
+  }
+
   // Validates one candidate path at a time. No shell: arguments are passed as
   // argv, so filenames with newlines, quotes or globs are inert. '%F:%s' with
   // no dereference; format fields cannot inject newlines into the payload.
@@ -401,6 +430,7 @@ Panel {
       }
     }
     stderr: StdioCollector { waitForEnd: true }
+    onExited: root.statPump()
   }
 
   // Quick-add fallback write (used when the inbox FileView is not loaded):
@@ -421,12 +451,21 @@ Panel {
 
   // Watches the Todos directory itself; "" while unconfigured/vaultPending
   // unloads it, so nothing is watched before the path is canonical.
+  // onFileChanged is coalesced through a debounce timer: an event storm
+  // (sync client churn or a hostile flood) must not spawn a find process
+  // per event.
+  Timer {
+    id: refreshDebounce
+    interval: 250
+    repeat: false
+    onTriggered: root.refresh()
+  }
   FileView {
     id: dirWatcher
     path: root.todosPath
     watchChanges: true
     printErrors: false
-    onFileChanged: root.refresh()
+    onFileChanged: refreshDebounce.restart()
   }
 
   Instantiator {
@@ -440,7 +479,7 @@ Panel {
       atomicWrites: true
       printErrors: false
       onLoaded: root.handleFileContent(fname, modelData.path, text())
-      onFileChanged: root.statProc.run(fname, modelData.path, "reload", root.scanGen)
+      onFileChanged: root.statRequest(fname, modelData.path, "reload", root.scanGen)
       onLoadFailed: root.removeFile(fname)
       Component.onCompleted: root.registerView(fname, fileView)
       Component.onDestruction: root.unregisterView(fname)
@@ -567,6 +606,7 @@ Panel {
         Text {
           visible: root.statusText !== ""
           width: parent.width
+          textFormat: Text.PlainText
           text: root.statusText
           color: root.urgentColor
           font.family: root.contentFontFamily
@@ -670,6 +710,7 @@ Panel {
 
           Text {
             width: parent.width
+            textFormat: Text.PlainText
             text: modelData.text
             color: row.done
               ? Qt.darker(root.contentForeground, 1.8)
@@ -683,6 +724,7 @@ Panel {
           Text {
             visible: modelData.due !== ""
             width: parent.width
+            textFormat: Text.PlainText
             text: "📅 " + modelData.due
             color: row.overdue ? root.urgentColor : Qt.darker(root.contentForeground, 1.5)
             font.family: root.contentFontFamily

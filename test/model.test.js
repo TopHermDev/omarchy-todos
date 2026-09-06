@@ -39,6 +39,29 @@ t("multiline task text flattened", function () {
   assert.strictEqual(tasks[0].text, "one two")
 })
 
+// ---- sanitizeTaskText ------------------------------------------------------------
+t("task text: flatten newlines/tabs and collapse whitespace", function () {
+  assert.strictEqual(m.sanitizeTaskText("one\ntwo"), "one two")
+  assert.strictEqual(m.sanitizeTaskText("- [ ] a\n- [x] b"), "- [ ] a - [x] b", "newline cannot forge task lines")
+  assert.strictEqual(m.sanitizeTaskText("a\t\tb\nc  d"), "a b c d")
+})
+t("task text: trims and rejects empty", function () {
+  assert.strictEqual(m.sanitizeTaskText("   "), null)
+  assert.strictEqual(m.sanitizeTaskText("\n\r\n"), null)
+  assert.strictEqual(m.sanitizeTaskText(""), null)
+  assert.strictEqual(m.sanitizeTaskText(null), null)
+  assert.strictEqual(m.sanitizeTaskText("  hi  "), "hi")
+})
+t("task text: length cap", function () {
+  assert.strictEqual(m.sanitizeTaskText("x".repeat(513), 512), null)
+  assert.strictEqual(m.sanitizeTaskText("x".repeat(512), 512), "x".repeat(512))
+  assert.strictEqual(m.sanitizeTaskText("\n" + "x".repeat(513) + "\n", 512), null, "cap applies after flattening")
+})
+t("task text: default cap constant exists", function () {
+  assert.strictEqual(typeof m.MAX_TASK_LENGTH, "number")
+  assert.ok(m.MAX_TASK_LENGTH >= 128 && m.MAX_TASK_LENGTH <= 4096)
+})
+
 // ---- validateSegment -----------------------------------------------------------
 t("segment: plain names accepted", function () {
   assert.strictEqual(m.validateSegment("inbox.md"), "inbox.md")

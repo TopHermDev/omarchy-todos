@@ -60,6 +60,19 @@ function parseStatPayload(payload, maxBytes) {
   return { ok: true, size: size }
 }
 
+var MAX_TASK_LENGTH = 512
+
+// Quick-add text arrives from IPC/UI and is unbounded: flatten to a single
+// line (newlines would forge extra task lines), collapse whitespace, and cap
+// the length. Returns the sanitized text or null if unusable.
+function sanitizeTaskText(text, maxLen) {
+  var s = String(text == null ? "" : text).replace(/[\r\n\t]+/g, " ")
+  s = s.replace(/\s+/g, " ").replace(/^\s+|\s+$/g, "")
+  if (s === "") return null
+  if (maxLen != null && s.length > maxLen) return null
+  return s
+}
+
 function parseTasks(markdown) {
   var lines = String(markdown || "").split(/\r?\n/)
   var tasks = []
@@ -139,10 +152,12 @@ if (typeof module !== "undefined") {
     toggleTaskLine: toggleTaskLine,
     toggleTaskIn: toggleTaskIn,
     appendTask: appendTask,
+    sanitizeTaskText: sanitizeTaskText,
     dateKey: dateKey,
     isOverdue: isOverdue,
     validateSegment: validateSegment,
     validateVaultPath: validateVaultPath,
-    parseStatPayload: parseStatPayload
+    parseStatPayload: parseStatPayload,
+    MAX_TASK_LENGTH: MAX_TASK_LENGTH
   }
 }
