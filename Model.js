@@ -1,29 +1,71 @@
-// Obsidian-tasks markdown parsing. Kept Qt-free so it can be unit tested
-// under node (node -e "var m=require('./Model.js'); ...").
+// Obsidian-tasks markdown parsing and vault path validation. Kept Qt-free so
+// it can be unit tested under node (node -e "var m=require('./Model.js'); ...").
 
 var CHECKBOX = /^(\s*[-*]\s+\[)([ xX])(\]\s+)(.*)$/
 var DUE = /📅\s*(\d{4}-\d{2}-\d{2})/
+var CONTROL = /[\u0000-\u001f\u007f]/
+// Characters that are structurally meaningful in the discovery pipeline:
+// \u0000 is the find -print0 framing and \u0001 the files-list key joiner.
+// Other control characters (including \n) inside a filename are harmless —
+// NUL framing means they cannot forge separators, and filenames are never
+// rendered — so they are allowed rather than turned into a denial of service.
+var FRAMING = /[\u0000\u0001]/
 
-// Resource bounds. The vault is populated by sync tools, so a peer can drop
-// arbitrarily large files or many files into it. Cap how much we parse and
-// retain so a synced peer cannot exhaust the long-lived shell.
-var MAX_PARSE_CHARS = 512 * 1024
-var MAX_PARSE_LINES = 10000
-var MAX_TASKS = 1000
-var MAX_TASK_CHARS = 2000
+// ---- vault filesystem validation --------------------------------------------
+// These helpers encode the filesystem boundary rules used by Panel.qml. They
+// are pure string predicates so the boundary logic itself can be unit tested.
+
+var MAX_NAME_LENGTH = 255
+
+// A single plain path segment: no separators, no traversal, no control
+// characters. Returns the sanitized segment or null if unusable.
+function validateSegment(v) {
+  var s = String(v == null ? "" : v).trim()
+  if (s === "" || s === "." || s === "..") return null
+  if (s.indexOf("/") !== -1 || s.indexOf("\\") !== -1) return null
+  if (CONTROL.test(s)) return null
+  return s
+}
+
+// A discovered file path must sit directly inside todosPath and be a safe
+// basename. Works on NUL-delimited find output where filenames may contain
+// newlines. Returns { ok: true, name } or { ok: false, reason }.
+function validateVaultPath(todosPath, p, maxNameLength) {
+  var cap = maxNameLength || MAX_NAME_LENGTH
+  var path = String(p == null ? "" : p)
+  var prefix = String(todosPath == null ? "" : todosPath) + "/"
+  if (path.lastIndexOf(prefix, 0) !== 0) return { ok: false, reason: "path escaped vault" }
+  var name = path.slice(prefix.length)
+  if (name === "" || name.length > cap) return { ok: false, reason: "overlong filename" }
+  if (FRAMING.test(name)) return { ok: false, reason: "unexpected filename" }
+  if (name === "." || name === ".." || name === "__proto__" || name.indexOf("/") !== -1)
+    return { ok: false, reason: "unexpected filename" }
+  return { ok: true, name: name }
+}
+
+// Parses `stat -c '%F:%s'` output (no dereference). Returns
+// { ok: true, size } for regular files within maxBytes, otherwise
+// { ok: false, reason }. "unparsable stat output" indicates malformed data
+// (abort-worthy); other reasons are skip-worthy (e.g. symlink, too large).
+function parseStatPayload(payload, maxBytes) {
+  var s = String(payload == null ? "" : payload)
+  var i = s.indexOf(":")
+  if (i === -1) return { ok: false, reason: "unparsable stat output" }
+  var type = s.slice(0, i)
+  var size = parseInt(s.slice(i + 1), 10)
+  if (type !== "regular file" && type !== "regular empty file")
+    return { ok: false, reason: "not a regular file" }
+  if (isNaN(size) || size < 0) return { ok: false, reason: "unparsable stat output" }
+  if (maxBytes != null && size > maxBytes) return { ok: false, reason: "file too large" }
+  return { ok: true, size: size }
+}
 
 function parseTasks(markdown) {
-  var text = String(markdown || "")
-  if (text.length > MAX_PARSE_CHARS) text = text.slice(0, MAX_PARSE_CHARS)
-  var lines = text.split(/\r?\n/)
+  var lines = String(markdown || "").split(/\r?\n/)
   var tasks = []
-  var n = lines.length < MAX_PARSE_LINES ? lines.length : MAX_PARSE_LINES
-  for (var i = 0; i < n; i++) {
+  for (var i = 0; i < lines.length; i++) {
     var t = parseTaskLine(lines[i], i)
-    if (t) {
-      tasks.push(t)
-      if (tasks.length >= MAX_TASKS) break
-    }
+    if (t) tasks.push(t)
   }
   return tasks
 }
@@ -88,25 +130,6 @@ function isOverdue(due, today) {
   return due !== "" && due < today
 }
 
-// Reduce a user-supplied setting to a single safe directory/file name. Strips
-// path separators and control characters, then leading dots and dashes so the
-// result can't be absolute, hidden, a parent reference (".."), or a command
-// option ("-"). Falls back when nothing safe remains.
-function sanitizeComponent(value, fallback) {
-  var s = String(value == null ? "" : value).trim()
-  s = s.replace(/[\\\/\x00-\x1f]+/g, "")
-  s = s.replace(/^[.\-]+/, "")
-  if (s === "") s = fallback
-  return s
-}
-
-// Bound the length of a single task before it is written to disk.
-function truncateTaskText(text) {
-  var s = String(text == null ? "" : text)
-  if (s.length > MAX_TASK_CHARS) s = s.slice(0, MAX_TASK_CHARS)
-  return s
-}
-
 if (typeof module !== "undefined") {
   module.exports = {
     parseTasks: parseTasks,
@@ -118,7 +141,8 @@ if (typeof module !== "undefined") {
     appendTask: appendTask,
     dateKey: dateKey,
     isOverdue: isOverdue,
-    sanitizeComponent: sanitizeComponent,
-    truncateTaskText: truncateTaskText
+    validateSegment: validateSegment,
+    validateVaultPath: validateVaultPath,
+    parseStatPayload: parseStatPayload
   }
 }

@@ -36,7 +36,8 @@ machine B's bar updates within seconds.
   machines.
 
 No external runtime dependencies: the plugin uses only standard coreutils
-(`find`, `bash`, `printf`, `mkdir`) plus Omarchy's built-in shell components.
+(`find`, `stat`, `bash`, `mktemp`, `mv`) plus Omarchy's built-in shell
+components.
 
 ## Installation
 
@@ -149,20 +150,66 @@ is canonicalized (`~` expanded, trailing slashes removed) and must be absolute.
 | `close`   | —      | —       | Close the popup.                  |
 | `toggle`  | —      | —       | Toggle the popup open/closed.     |
 
+## Security model
+
+The plugin treats the vault as a trust boundary: every path it reads or writes
+must stay inside the configured vault, refer to a validated regular file, and
+consume bounded resources.
+
+**Path handling**
+
+- `vaultPath` is canonicalized once with `realpath -e` (symlinks, `~` and
+  relative components resolved) before anything derives paths from it.
+- Paths are only ever passed as **argv** to `find`/`stat`/`mv` — never
+  interpolated into a shell command — and task text is likewise argv-only.
+
+**Discovery and reads**
+
+- `find -print0` streams NUL-delimited results; entries are validated as they
+  arrive (plain basename, ≤ 255 bytes, no control characters) and enumeration
+  stops at **256 files**.
+- Every candidate is statted *before* a file view is created: `stat -c '%F:%s'`
+  (no dereference) rejects symlinks, non-regular files, and anything over the
+  **1 MiB** cap.
+- Watched-file reloads re-run the same gate; a failed check keeps the
+  last-known-good content.
+
+**Writes (quick-add, checkboxes)**
+
+- Writes are atomic: `mktemp` (0600) → write → `mv -f` over the target
+  (`add-task.sh` is the fail-closed fallback used when the in-process path
+  isn't available).
+- A symlinked target is **refused**, never written through; the parent
+  directory must be a real directory at rename time, so a swapped `Todos/`
+  symlink can't redirect the write outside the vault.
+- The existing file's mode is preserved on replace.
+
+**Limits and residual risk**
+
+- Validation happens stat-then-open, so a narrow TOCTOU window remains; closing
+  it fully requires a native backend
+  (`open`/`fstat`/`O_NOFOLLOW`/`openat2(RESOLVE_BENEATH)`), which belongs in
+  Quickshell core rather than this plugin.
+- If you intentionally symlink `inbox.md` (or `Todos/`) elsewhere, quick-add
+  fails closed with a status message instead of following the link.
+
 ## Development
 
 ```
 omarchy-todos/
 ├── manifest.json   # plugin metadata, settings schema
-├── Model.js        # Obsidian-tasks markdown parsing (pure JS, node-testable)
+├── Model.js        # markdown parsing + path/stat validators (pure JS, node-testable)
 ├── Panel.qml       # bar widget + popup
+├── add-task.sh     # fail-closed atomic quick-add fallback (used by Panel.qml)
+├── test/           # model.test.js + adversarial vault-fixture.sh
 └── README.md
 ```
 
 `Model.js` is Qt-free so it can be unit tested under node:
 
 ```bash
-node -e 'var m=require("./Model.js"); console.log(m.parseTasks("- [ ] a\n- [x] b"))'
+node test/model.test.js       # validator unit tests
+bash test/vault-fixture.sh    # adversarial filesystem fixture (22 checks)
 ```
 
 To develop locally, clone a working copy into `~/.config/omarchy/plugins/`.

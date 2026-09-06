@@ -6,41 +6,103 @@ import qs.Ui
 import qs.Commons
 import "Model.js" as Model
 
+// Filesystem boundary rules enforced here:
+//  - File discovery streams NUL-delimited find output (filenames cannot forge
+//    separators), is capped while consuming (never buffers unbounded output),
+//    and aborts if anything unexpected appears on the stream.
+//  - Nothing is loaded until a stat (no dereference) of the exact candidate
+//    path confirms a regular file under the size cap. Only then is the
+//    FileView for that path created. Every watch-triggered reload re-runs the
+//    same checks and keeps the last good data if validation fails.
+//  - Task writes never touch the shell for redirection (which would follow a
+//    planted inbox.md symlink). The file is staged under mktemp and renamed
+//    over the target; atomicWrites does the same, so a symlinked inbox.md or
+//    a swapped Todos/ directory is *replaced* (still inside the vault), never
+//    written through.
+// Residual TOCTOU between stat and load is inherent to the QML toolset; the
+// reload re-validation and hard size cap bound what an attacker can achieve
+// through it. A native backend (open/fstat/O_NOFOLLOW) would close it fully.
 Panel {
   id: root
   moduleName: "jeanhuit.todos"
   ipcTarget: "jeanhuit.todos"
   manageIpc: false
 
-  readonly property string vaultPath: root.canonicalizeVault(setting("vaultPath", ""))
-  readonly property string todosDirName: Model.sanitizeComponent(setting("todosDir", "Todos"), "Todos")
-  readonly property string inboxFile: Model.sanitizeComponent(setting("inboxFile", "inbox.md"), "inbox.md")
+  // ---- resource limits ---------------------------------------------------
+  readonly property int maxFiles: 256                 // files scanned / watched
+  readonly property int maxFileSize: 1 * 1024 * 1024  // bytes per file (approximate in chars on read)
+
+  // ---- configuration -------------------------------------------------------
+  readonly property string rawVaultPath: setting("vaultPath", "")
+  readonly property string todosDirName: sanitizeSegment(setting("todosDir", "Todos"), "Todos")
+  readonly property string inboxFile: sanitizeSegment(setting("inboxFile", "inbox.md"), "inbox.md")
   readonly property bool showCompleted: setting("showCompleted", false) === true
 
-  readonly property bool configured: vaultPath !== ""
-  readonly property string todosPath: vaultPath + "/" + todosDirName
-  readonly property string vaultName: configured ? vaultPath.replace(/\/+$/, "").split("/").pop() : ""
+  // rawVaultPath is what the user typed (kept for the setup form). Everything
+  // that touches the filesystem is derived from the canonicalized vaultPath.
+  readonly property bool configured: String(rawVaultPath).trim() !== ""
+  property bool vaultPending: false
+  property string vaultPath: ""
+  readonly property string todosPath: vaultPath === "" ? "" : vaultPath + "/" + todosDirName
+  readonly property string vaultName: vaultPath === "" ? "" : vaultPath.split("/").pop()
 
+  function sanitizeSegment(value, fallback) {
+    // Single plain path segment (see Model.validateSegment); anything else
+    // falls back to the default.
+    return Model.validateSegment(value) || fallback
+  }
+
+  function normalizeVaultPath() {
+    // Canonicalize once (symlinks resolved, ~ and relative paths expanded) so
+    // every derived path is a plain, unambiguous location.
+    var raw = String(rawVaultPath).trim()
+    if (raw === "") {
+      vaultPath = ""
+      vaultPending = false
+      return
+    }
+    var abs = raw
+    if (abs.charAt(0) === "~")
+      abs = abs.replace(/^~(\/|$)/, Quickshell.env("HOME") + "/")
+    if (abs.charAt(0) !== "/")
+      abs = Quickshell.env("PWD") + "/" + abs
+    vaultPending = true
+    canonProc.run(abs)
+  }
+
+  function persistSettings(values) {
+    var entry = { id: root.moduleName }
+    for (var existing in root.settings) if (existing !== "id") entry[existing] = root.settings[existing]
+    for (var key in values) entry[key] = values[key]
+    root.settings = entry
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
+      root.bar.shell.updateEntryInline(root.moduleName, entry)
+  }
+
+  function saveVault() {
+    var path = String(vaultField.text || "").replace(/^\s+|\s+$/g, "").replace(/\/+$/, "")
+    if (path === "") return
+    persistSettings({ vaultPath: path }) // rawVaultPath change re-canonicalizes
+  }
+
+  // ---- state ---------------------------------------------------------------
   readonly property color contentForeground: root.barForeground
   readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color urgentColor: bar && bar.urgent ? bar.urgent : Color.urgent
   readonly property string todayKey: Model.dateKey(new Date())
 
   property var files: []
+  property var pendingFiles: []
   property var fileData: ({})
   property var taskList: []
   property var displayList: []
   property int openCount: 0
   property var views: ({})
   property string filesKey: ""
-
-  // Cap how many markdown files we watch. The vault is populated by sync
-  // tools, so a peer can drop arbitrarily many files into it; without a cap
-  // each one becomes a FileView and a retained parse result.
-  readonly property int maxFiles: 256
-  // Cap the size of each file we read. Files at or above this size are not
-  // listed, so FileView never materializes an unboundedly large file.
-  readonly property int maxFileBytes: 262144
+  property bool scanAborted: false
+  property bool scanCapped: false
+  property int scanGen: 0
+  property string statusText: ""
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -48,22 +110,6 @@ Panel {
   readonly property var openTasks: displayList.filter(function (t) { return !t.done })
   readonly property var doneTasks: displayList.filter(function (t) { return t.done })
   readonly property int doneCount: doneTasks.length
-
-  // Expand "~" and strip trailing slashes, and require an absolute path so the
-  // vault can never resolve relative to an unpredictable working directory or
-  // start with "-" (which find would treat as an option).
-  function canonicalizeVault(path) {
-    var p = String(path == null ? "" : path).trim()
-    if (p === "") return ""
-    if (p === "~" || p.slice(0, 2) === "~/") {
-      var home = Quickshell.env("HOME")
-      if (typeof home !== "string" || home === "") return ""
-      p = p === "~" ? home : home + p.slice(1)
-    }
-    p = p.replace(/\/+$/, "")
-    if (p === "" || p.charAt(0) !== "/") return ""
-    return p
-  }
 
   function recompute() {
     var list = []
@@ -101,7 +147,7 @@ Panel {
   function setFile(name, path, content) {
     var next = {}
     for (var k in fileData) next[k] = fileData[k]
-    next[name] = { path: path, tasks: Model.parseTasks(content) }
+    next[name] = { path: path, content: String(content || ""), tasks: Model.parseTasks(content) }
     fileData = next
     recompute()
   }
@@ -116,38 +162,114 @@ Panel {
   function registerView(name, view) { views[name] = view }
   function unregisterView(name) { delete views[name] }
 
+  function abortScan(reason) {
+    // One strike: anything unexpected from the discovery stream (bogus or
+    // overlong filename, malformed output) stops the whole scan and keeps
+    // the previous, validated file list.
+    if (scanAborted) return
+    scanAborted = true
+    statusText = "scan aborted: " + reason
+    if (listProc.running) listProc.signal(15)
+  }
+
+  function clearResults() {
+    files = []
+    pendingFiles = []
+    fileData = ({})
+    taskList = []
+    displayList = []
+    openCount = 0
+  }
+
+  // ---- file discovery --------------------------------------------------------
   function refresh() {
-    if (!root.configured) {
-      files = []
-      fileData = ({})
-      taskList = []
-      displayList = []
-      openCount = 0
+    if (!root.configured || vaultPending || todosPath === "") {
+      clearResults()
       return
     }
-    listProc.command = ["find", "-P", root.todosPath, "-maxdepth", "1", "-type", "f", "-size", "-" + root.maxFileBytes + "c", "-name", "*.md", "-printf", "%f\\n"]
+    scanGen++
+    scanAborted = false
+    scanCapped = false
+    statusText = ""
+    pendingFiles = []
+    listProc.command = ["find", todosPath, "-maxdepth", "1", "-type", "f", "-name", "*.md", "-print0"]
     listProc.running = true
   }
 
-  function applyFileList(raw) {
-    var seen = String(raw || "").split("\n")
-    var names = []
-    for (var i = 0; i < seen.length; i++) {
-      var n = seen[i]
-      if (n === "") continue
-      if (names.indexOf(n) === -1) names.push(n)
+  function handleDiscoveredPath(p) {
+    // Streamed consumption: validate and account for each entry as it
+    // arrives; enumeration is killed at the cap instead of buffering the
+    // full find output.
+    if (scanAborted || p === "") return
+    // find -print0 yields full paths; require the exact vault prefix and a
+    // safe basename (see Model.validateVaultPath).
+    var res = Model.validateVaultPath(todosPath, p)
+    if (!res.ok) { abortScan(res.reason); return }
+    var name = res.name
+    if (pendingFiles.length >= maxFiles) {
+      // Bounded consumption: maxFiles validated entries collected, so stop
+      // reading instead of buffering more; what we have gets committed.
+      if (!scanCapped && listProc.running) {
+        scanCapped = true
+        listProc.signal(15) // SIGTERM: enumeration stops at the cap
+      }
+      return
     }
-    names.sort()
-    if (names.length > root.maxFiles) names = names.slice(0, root.maxFiles)
+    if (pendingFiles.some(function (f) { return f.name === name })) return
+    pendingFiles.push({ name: name, path: p })
+    // Stat the exact path find reported, not a reconstructed one.
+    statProc.run(name, p, "discover", scanGen)
+  }
 
-    var key = names.join("\u0001")
+  // stat -c '%F:%s' with no dereference: a symlink is reported as
+  // "symbolic link" and rejected. Runs one candidate at a time; validation
+  // happens before the FileView for that path is ever created.
+  function handleStatResult(name, mode, gen, payload) {
+    if (gen !== scanGen) return // superseded by a newer scan
+    var res = Model.parseStatPayload(payload, maxFileSize)
+
+    if (mode === "reload") {
+      // Re-validate from disk before loading: the object at the watched path
+      // may have been replaced since the last check. On failure the view
+      // keeps its last good data (stale-but-valid beats fresh-but-unchecked).
+      if (res.ok && views[name]) views[name].reload()
+      return
+    }
+
+    if (!res.ok) {
+      if (res.reason === "unparsable stat output") abortScan(res.reason)
+      return // symlink / non-regular / too large: never watched
+    }
+    if (!pendingFiles.some(function (f) { return f.name === name })) return
+    // Only now create the watch/read view for this path.
+    var next = files.slice()
+    next.push({ name: name, path: todosPath + "/" + name })
+    files = next
+  }
+
+  function commitFileList() {
+    if (scanAborted) return
+    // find exit code 1 usually means a raced deletion; stderr already flagged
+    // real problems. Keep the previously validated list on abnormal exits.
+    var key = pendingFiles.map(function (f) { return f.name }).join("\u0001")
     if (key === filesKey) return
     filesKey = key
+    files = pendingFiles
+    // Drop data/views for files that disappeared.
+    var present = {}
+    for (var i = 0; i < pendingFiles.length; i++) present[pendingFiles[i].name] = true
+    var removed = false
+    for (var k in fileData) if (!present[k]) { removeFile(k); removed = true }
+    if (removed) recompute()
+  }
 
-    var list = []
-    for (var j = 0; j < names.length; j++)
-      list.push({ name: names[j], path: root.todosPath + "/" + names[j] })
-    files = list
+  // ---- content handling -------------------------------------------------------
+  function handleFileContent(name, path, rawContent) {
+    // Defense in depth: even though stat capped the size before the view
+    // was created, truncate before anything downstream parses it.
+    var content = String(rawContent || "")
+    if (content.length > maxFileSize) content = content.slice(0, maxFileSize)
+    setFile(name, path, content)
   }
 
   function toggleTask(task) {
@@ -164,10 +286,25 @@ Panel {
   }
 
   function addTask(text) {
-    var t = String(text || "").replace(/\r?\n/g, " ").replace(/^\s+|\s+$/g, "")
-    t = Model.truncateTaskText(t)
-    if (!root.configured || t === "") return
-    addProc.run("- [ ] " + t, root.todosPath + "/" + root.inboxFile)
+    var t = String(text || "").replace(/^\s+|\s+$/g, "").replace(/[\r\n]+/g, " ")
+    if (!root.configured || vaultPending || todosPath === "" || t === "") return
+    var line = "- [ ] " + t
+    var path = todosPath + "/" + inboxFile
+    // Preferred write path: no shell at all. appendTask + setText goes
+    // through FileView's atomicWrites (temp file + rename), so a planted
+    // inbox.md symlink is replaced rather than written through and nothing
+    // is passed through bash.
+    var view = views[inboxFile]
+    if (view && view.loaded) {
+      view.setText(Model.appendTask(String(view.text() || ""), t))
+      setFile(inboxFile, path, Model.appendTask(String(fileData[inboxFile] ? fileData[inboxFile].content : ""), t))
+      return
+    }
+    // Fallback: symlink-safe staged rename via add-task.sh (see that file).
+    // A swapped Todos/ directory or a symlinked inbox.md is refused
+    // (O_NOFOLLOW-equivalent); junk in argv is inert because nothing is
+    // expanded by a shell.
+    addProc.run(line, path)
   }
 
   function submitQuick() {
@@ -175,26 +312,12 @@ Panel {
     quickField.text = ""
   }
 
-  function saveVault() {
-    var path = String(vaultField.text || "").replace(/^\s+|\s+$/g, "").replace(/\/+$/, "")
-    if (path === "") return
-    persistSettings({ vaultPath: path })
-  }
-
-  function persistSettings(values) {
-    var entry = { id: root.moduleName }
-    for (var existing in root.settings) if (existing !== "id") entry[existing] = root.settings[existing]
-    for (var key in values) entry[key] = values[key]
-    root.settings = entry
-    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
-      root.bar.shell.updateEntryInline(root.moduleName, entry)
-  }
-
   readonly property string displayText: root.configured
     ? (root.openCount > 0 ? String(root.openCount) : "✓")
     : "!"
 
-  Component.onCompleted: refresh()
+  Component.onCompleted: normalizeVaultPath()
+  onRawVaultPathChanged: normalizeVaultPath()
   onTodosPathChanged: refresh()
   onOpenedChanged: if (root.opened) refresh()
 
@@ -206,40 +329,108 @@ Panel {
     function show() { root.open() }
     function hide() { root.close() }
     function toggle() { root.toggle() }
-    function refresh(): void { root.refresh() }
+    function refresh() { root.refresh() }
     function add(text: string): string { root.addTask(text); return "ok" }
     function count(): string { return String(root.openCount) }
   }
 
+  // Canonicalize the configured vault path once (symlinks resolved) so every
+  // path we derive is unambiguous. Paths are only used as find/stat/mv argv —
+  // never passed through a shell — so no quoting is needed.
   Process {
-    id: listProc
+    id: canonProc
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.applyFileList(String(text || ""))
+      onStreamFinished: {
+        var canon = String(text || "").replace(/^\s+|\s+$/g, "")
+        root.vaultPending = false
+        if (canon === "" || canon.indexOf("\n") !== -1) return
+        root.vaultPath = canon
+      }
+    }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      root.vaultPending = false
+      if (exitCode !== 0) root.statusText = "vault path not found"
+    }
+  }
+
+  Process {
+    id: listProc
+    stdout: SplitParser {
+      splitMarker: "\u0000"
+      onRead: function (data) { root.handleDiscoveredPath(String(data)) }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        // find's stderr can echo attacker-controlled filenames; flatten and
+        // cap it before it reaches the status line.
+        var t = String(text || "").replace(/[\r\n]+/g, " ").trim()
+        if (t !== "") root.abortScan("find reported: " + t.slice(0, 120))
+      }
+    }
+    onExited: function(exitCode) {
+      // exitCode 0 = full scan; scanCapped = we stopped it at the cap.
+      // Anything else (aborted/error) keeps the previously validated list.
+      if (exitCode === 0 || root.scanCapped) root.commitFileList()
+    }
+  }
+
+  // Validates one candidate path at a time. No shell: arguments are passed as
+  // argv, so filenames with newlines, quotes or globs are inert. '%F:%s' with
+  // no dereference; format fields cannot inject newlines into the payload.
+  Process {
+    id: statProc
+    property string name: ""
+    property string mode: ""
+    property int gen: 0
+    function run(n, path, m, g) {
+      name = n
+      mode = m
+      gen = g
+      command = ["stat", "-c", "%F:%s", "--", path]
+      running = true
+    }
+    stdout: SplitParser {
+      // stat's own argv cannot contain newlines and %F/%s are fixed coreutils
+      // strings, so newline framing is safe here (unlike find output).
+      splitMarker: "\n"
+      onRead: function (data) {
+        root.handleStatResult(statProc.name, statProc.mode, statProc.gen, String(data))
+      }
     }
     stderr: StdioCollector { waitForEnd: true }
   }
 
+  // Quick-add fallback write (used when the inbox FileView is not loaded):
+  // stage in a private temp file, then rename over the target. No `>>`
+  // redirection anywhere — that would follow symlinks. See add-task.sh.
   Process {
     id: addProc
     function run(line, path) {
-      command = ["bash", "-c", 'mkdir -p "$(dirname "$2")" && printf "%s\\n" "$1" >> "$2"', "_", line, path]
+      command = ["bash", Qt.resolvedUrl("add-task.sh").replace("file://", ""), line, path]
       running = true
     }
-    onExited: root.refresh()
+    onExited: function(exitCode) {
+      if (exitCode === 0) root.refresh()
+      else root.statusText = "could not add task"
+    }
     stderr: StdioCollector { waitForEnd: true }
   }
 
+  // Watches the Todos directory itself; "" while unconfigured/vaultPending
+  // unloads it, so nothing is watched before the path is canonical.
   FileView {
     id: dirWatcher
-    path: root.configured ? root.todosPath : ""
+    path: root.todosPath
     watchChanges: true
     printErrors: false
     onFileChanged: root.refresh()
   }
 
   Instantiator {
-    model: root.files
+    model: root.files // only stat-validated files reach this model
     delegate: FileView {
       id: fileView
       required property var modelData
@@ -248,8 +439,8 @@ Panel {
       watchChanges: true
       atomicWrites: true
       printErrors: false
-      onLoaded: root.setFile(fname, modelData.path, text())
-      onFileChanged: reload()
+      onLoaded: root.handleFileContent(fname, modelData.path, text())
+      onFileChanged: root.statProc.run(fname, modelData.path, "reload", root.scanGen)
       onLoadFailed: root.removeFile(fname)
       Component.onCompleted: root.registerView(fname, fileView)
       Component.onDestruction: root.unregisterView(fname)
@@ -373,6 +564,16 @@ Panel {
           }
         }
 
+        Text {
+          visible: root.statusText !== ""
+          width: parent.width
+          text: root.statusText
+          color: root.urgentColor
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+
         PanelSectionHeader {
           visible: root.configured && root.openTasks.length > 0
           text: "Open"
@@ -470,7 +671,6 @@ Panel {
           Text {
             width: parent.width
             text: modelData.text
-            textFormat: Text.PlainText
             color: row.done
               ? Qt.darker(root.contentForeground, 1.8)
               : (row.overdue ? root.urgentColor : root.contentForeground)
@@ -484,7 +684,6 @@ Panel {
             visible: modelData.due !== ""
             width: parent.width
             text: "📅 " + modelData.due
-            textFormat: Text.PlainText
             color: row.overdue ? root.urgentColor : Qt.darker(root.contentForeground, 1.5)
             font.family: root.contentFontFamily
             font.pixelSize: Style.font.caption
