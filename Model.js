@@ -73,12 +73,26 @@ function sanitizeTaskText(text, maxLen) {
   return s
 }
 
+// Resource bounds for parsing. The vault is populated by sync tools, so a
+// peer can drop arbitrarily large files into it; even with the 1 MiB stat
+// gate, bound how much is parsed and retained so the long-lived shell cannot
+// be exhausted by checkbox spam.
+var MAX_PARSE_CHARS = 512 * 1024
+var MAX_PARSE_LINES = 10000
+var MAX_TASKS = 1000
+
 function parseTasks(markdown) {
-  var lines = String(markdown || "").split(/\r?\n/)
+  var text = String(markdown || "")
+  if (text.length > MAX_PARSE_CHARS) text = text.slice(0, MAX_PARSE_CHARS)
+  var lines = text.split(/\r?\n/)
   var tasks = []
-  for (var i = 0; i < lines.length; i++) {
+  var n = lines.length < MAX_PARSE_LINES ? lines.length : MAX_PARSE_LINES
+  for (var i = 0; i < n; i++) {
     var t = parseTaskLine(lines[i], i)
-    if (t) tasks.push(t)
+    if (t) {
+      tasks.push(t)
+      if (tasks.length >= MAX_TASKS) break
+    }
   }
   return tasks
 }
@@ -158,6 +172,9 @@ if (typeof module !== "undefined") {
     validateSegment: validateSegment,
     validateVaultPath: validateVaultPath,
     parseStatPayload: parseStatPayload,
-    MAX_TASK_LENGTH: MAX_TASK_LENGTH
+    MAX_TASK_LENGTH: MAX_TASK_LENGTH,
+    MAX_PARSE_CHARS: MAX_PARSE_CHARS,
+    MAX_PARSE_LINES: MAX_PARSE_LINES,
+    MAX_TASKS: MAX_TASKS
   }
 }

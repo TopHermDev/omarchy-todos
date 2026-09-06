@@ -147,7 +147,9 @@ Panel {
   function setFile(name, path, content) {
     var next = {}
     for (var k in fileData) next[k] = fileData[k]
-    next[name] = { path: path, content: String(content || ""), tasks: Model.parseTasks(content) }
+    // Parse results are retained; the raw content is not (it can be large
+    // and is re-read from the view whenever needed, e.g. on toggle).
+    next[name] = { path: path, tasks: Model.parseTasks(content) }
     fileData = next
     recompute()
   }
@@ -196,7 +198,7 @@ Panel {
     // validated against the NEW todosPath and its stderr could abort THIS
     // scan. Dropping the connection also discards cross-generation output.
     if (listProc.running) listProc.running = false
-    listProc.command = ["find", todosPath, "-maxdepth", "1", "-type", "f", "-name", "*.md", "-print0"]
+    listProc.command = ["find", "-P", todosPath, "-maxdepth", "1", "-type", "f", "-name", "*.md", "-print0"]
     listProc.running = true
   }
 
@@ -303,7 +305,7 @@ Panel {
     var view = views[inboxFile]
     if (view && view.loaded) {
       view.setText(Model.appendTask(String(view.text() || ""), t))
-      setFile(inboxFile, path, Model.appendTask(String(fileData[inboxFile] ? fileData[inboxFile].content : ""), t))
+      setFile(inboxFile, path, Model.appendTask(view && view.loaded ? String(view.text() || "") : "", t))
       return
     }
     // Fallback: symlink-safe staged rename via add-task.sh (see that file).

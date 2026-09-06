@@ -62,6 +62,19 @@ t("task text: default cap constant exists", function () {
   assert.ok(m.MAX_TASK_LENGTH >= 128 && m.MAX_TASK_LENGTH <= 4096)
 })
 
+// ---- parse bounds -----------------------------------------------------------------
+t("parseTasks: line/char/task caps bound output", function () {
+  var big = ""
+  for (var i = 0; i < 20000; i++) big += "- [ ] task " + i + "\n"
+  assert.strictEqual(m.parseTasks(big).length, m.MAX_TASKS)
+  var halfMeg = "x".repeat(600 * 1024) + "\n- [ ] after cap"
+  assert.strictEqual(m.parseTasks(halfMeg).length, 0, "checkbox beyond char cap is not parsed")
+})
+t("parseTasks: normal files unaffected by caps", function () {
+  var small = "- [ ] a\n- [x] b\n- [ ] c"
+  assert.strictEqual(m.parseTasks(small).length, 3)
+})
+
 // ---- validateSegment -----------------------------------------------------------
 t("segment: plain names accepted", function () {
   assert.strictEqual(m.validateSegment("inbox.md"), "inbox.md")
