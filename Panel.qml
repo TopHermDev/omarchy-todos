@@ -347,6 +347,10 @@ Panel {
   // never passed through a shell — so no quoting is needed.
   Process {
     id: canonProc
+    function run(abs) {
+      command = ["realpath", "-e", "--", abs]
+      running = true
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
