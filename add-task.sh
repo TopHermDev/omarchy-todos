@@ -18,8 +18,9 @@
 #      object is always a regular file inside the vault
 #
 # Residual TOCTOU between the stat checks and the rename is accepted here;
-# the QML layer prefers FileView's atomicWrites path (no shell) when the
-# inbox view is already loaded.
+# the rename itself never follows a final-component symlink. There is no
+# in-process setText() alternative: Quickshell's atomicWrites uses QSaveFile,
+# which resolves an existing symlink before choosing the write target.
 set -u
 
 line=$1

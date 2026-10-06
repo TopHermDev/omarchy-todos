@@ -171,14 +171,21 @@ consume bounded resources.
 - Every candidate is statted *before* a file view is created: `stat -c '%F:%s'`
   (no dereference) rejects symlinks, non-regular files, and anything over the
   **1 MiB** cap.
+- The file list is committed only after `find` exits *and* the stat queue has
+  drained; only candidates that passed their queued stat are published — raw
+  `find` output never reaches a view.
 - Watched-file reloads re-run the same gate; a failed check keeps the
   last-known-good content.
 
 **Writes (quick-add, checkboxes)**
 
-- Writes are atomic: `mktemp` (0600) → write → `mv -f` over the target
-  (`add-task.sh` is the fail-closed fallback used when the in-process path
-  isn't available).
+- Every write goes through a helper — `add-task.sh` (quick-add append) or
+  `replace-line.sh` (checkbox toggle) — as `mktemp` (0600) → write → `mv -f`
+  over the target. The in-process `FileView.setText()` path is deliberately
+  not used: Quickshell implements `atomicWrites` with `QSaveFile`, which
+  resolves an existing symlink before choosing the write target.
+- `replace-line.sh` compare-and-swaps: line *N* must still match what the
+  popup rendered, so an edit from a sync peer is refused, never overwritten.
 - A symlinked target is **refused**, never written through; the parent
   directory must be a real directory at rename time, so a swapped `Todos/`
   symlink can't redirect the write outside the vault.
@@ -200,7 +207,8 @@ omarchy-todos/
 ├── manifest.json   # plugin metadata, settings schema
 ├── Model.js        # markdown parsing + path/stat validators (pure JS, node-testable)
 ├── Panel.qml       # bar widget + popup
-├── add-task.sh     # fail-closed atomic quick-add fallback (used by Panel.qml)
+├── add-task.sh     # fail-closed atomic quick-add write (used by Panel.qml)
+├── replace-line.sh # fail-closed compare-and-swap checkbox toggle (Panel.qml)
 ├── test/           # model.test.js + adversarial vault-fixture.sh
 └── README.md
 ```
@@ -209,7 +217,7 @@ omarchy-todos/
 
 ```bash
 node test/model.test.js       # validator unit tests
-bash test/vault-fixture.sh    # adversarial filesystem fixture (22 checks)
+bash test/vault-fixture.sh    # adversarial filesystem fixture (39 checks)
 ```
 
 To develop locally, clone a working copy into `~/.config/omarchy/plugins/`.

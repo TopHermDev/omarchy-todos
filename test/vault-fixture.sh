@@ -20,6 +20,7 @@ check_exit() {
 
 here=$(cd "$(dirname "$0")/.." && pwd)
 script="$here/add-task.sh"
+rscript="$here/replace-line.sh"
 T=$(mktemp -d /tmp/todos-fixture-XXXXXX)
 trap 'rm -rf "$T"' EXIT
 
@@ -123,6 +124,62 @@ node -e '
   var r = m.parseStatPayload(process.argv[2], 1048576);
   process.exit(r.ok ? 1 : 0);
 ' "$here" "$payload" && ok "oversized file fails size gate" || bad "oversized file passed size gate"
+
+# --- T13: normal line replace (CAS pass) -------------------------------------
+note "T13 replace-line CAS pass"
+printf -- '- [ ] one\n- [ ] two\n- [x] three\n' > "$target"
+bash "$rscript" "$target" 1 '- [ ] two' '- [x] two' 2>/dev/null
+check_exit 0 $? "replace accepted"
+[ "$(sed -n 2p "$target")" = '- [x] two' ] && ok "line flipped" || bad "line not flipped"
+grep -qx -- '- \[ \] one' "$target" && ok "other lines intact" || bad "other lines changed"
+
+# --- T14: replace via symlinked target refused -------------------------------
+note "T14 replace-line symlinked target refused"
+rm -f "$target"
+printf 'SECRET2\n' > "$T/outside/secret2.md"
+ln -s "$T/outside/secret2.md" "$target"
+bash "$rscript" "$target" 0 'SECRET2' 'PWNED' 2>/dev/null
+check_exit 1 $? "symlink replace refused"
+[ "$(cat "$T/outside/secret2.md")" = "SECRET2" ] && ok "outside file untouched" || bad "outside file written"
+[ -L "$target" ] && ok "symlink left in place" || bad "symlink clobbered"
+
+# --- T15: replace through symlinked Todos dir refused ------------------------
+note "T15 replace-line symlinked parent refused"
+rm -f "$target"
+printf -- '- [ ] t\n' > "$T/outside/realTodos/todo.md"
+bash "$rscript" "$T/vaultB/Todos/todo.md" 0 '- [ ] t' '- [x] t' 2>/dev/null
+check_exit 1 $? "symlinked parent refused"
+[ "$(cat "$T/outside/realTodos/todo.md")" = '- [ ] t' ] && ok "outside content untouched" || bad "outside content changed"
+
+# --- T16: CAS mismatch refused (file changed under us) -----------------------
+note "T16 CAS mismatch refused"
+printf -- '- [ ] orig\n' > "$target"
+bash "$rscript" "$target" 0 '- [ ] DIFFERENT' '- [x] orig' 2>/dev/null
+check_exit 1 $? "stale expected refused"
+[ "$(cat "$target")" = '- [ ] orig' ] && ok "file untouched" || bad "file overwritten"
+
+# --- T17: bad line numbers refused -------------------------------------------
+note "T17 line number guards"
+printf -- '- [ ] only\n' > "$target"
+bash "$rscript" "$target" abc '- [ ] only' '- [x] only' 2>/dev/null
+check_exit 1 $? "non-numeric lineno refused"
+bash "$rscript" "$target" 99 '- [ ] only' '- [x] only' 2>/dev/null
+check_exit 1 $? "out-of-range lineno refused"
+[ "$(cat "$target")" = '- [ ] only' ] && ok "file untouched" || bad "file changed"
+
+# --- T18: CRLF line endings compared and round-tripped -----------------------
+note "T18 CRLF preserved"
+printf -- '- [ ] one\r\n- [ ] two\r\n' > "$target"
+bash "$rscript" "$target" 1 $'- [ ] two\r' $'- [x] two\r' 2>/dev/null
+check_exit 0 $? "CRLF CAS accepted"
+grep -qF -- $'- [x] two\r' "$target" && ok "CR kept on replaced line" || bad "CR lost"
+
+# --- T19: hostile replacement text inert (argv, no shell) ---------------------
+note "T19 hostile replacement text"
+printf -- '- [ ] x\n' > "$target"
+bash "$rscript" "$target" 0 '- [ ] x' '$(reboot) `id` ; rm -rf /tmp/zzz' 2>/dev/null
+check_exit 0 $? "hostile replacement accepted"
+grep -qF -- '$(reboot) `id` ; rm -rf /tmp/zzz' "$target" && ok "stored verbatim" || bad "mangled or executed"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

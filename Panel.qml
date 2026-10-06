@@ -14,14 +14,22 @@ import "Model.js" as Model
 //    path confirms a regular file under the size cap. Only then is the
 //    FileView for that path created. Every watch-triggered reload re-runs the
 //    same checks and keeps the last good data if validation fails.
-//  - Task writes never touch the shell for redirection (which would follow a
-//    planted inbox.md symlink). The file is staged under mktemp and renamed
-//    over the target; atomicWrites does the same, so a symlinked inbox.md or
-//    a swapped Todos/ directory is *replaced* (still inside the vault), never
-//    written through.
-// Residual TOCTOU between stat and load is inherent to the QML toolset; the
-// reload re-validation and hard size cap bound what an attacker can achieve
-// through it. A native backend (open/fstat/O_NOFOLLOW) would close it fully.
+//  - Discovery candidates only reach the file list after their queued stat
+//    has passed, and commitFileList() runs only once find has exited and the
+//    stat queue has drained: it publishes the stat-validated set, so raw find
+//    output never becomes a FileView.
+//  - Task writes never go through FileView.setText()/QSaveFile (it resolves
+//    an existing symlink before choosing the write target) and never through
+//    shell redirection (follows symlinks in every path component). Every
+//    write goes through a helper (add-task.sh / replace-line.sh) that
+//    lstat-checks the target and its parent, then stages under mktemp and
+//    renames over the target: a planted inbox.md symlink or a swapped
+//    Todos/ directory is *replaced* (still inside the vault), never written
+//    through.
+// Residual TOCTOU between stat and load (and between the helpers' checks and
+// their rename) is inherent to this toolset; the reload re-validation and
+// hard size cap bound what an attacker can achieve through it. A native
+// backend (open/fstat/O_NOFOLLOW) would close it fully.
 Panel {
   id: root
   moduleName: "jeanhuit.todos"
@@ -99,9 +107,11 @@ Panel {
   property int openCount: 0
   property var views: ({})
   property string filesKey: ""
+  property var scanValidated: []    // stat-validated entries of the current scan
   property bool scanAborted: false
   property bool scanCapped: false
   property int scanGen: 0
+  property bool commitPending: false // scan finished; commit once the stat queue drains
   property string statusText: ""
 
   implicitWidth: button.implicitWidth
@@ -177,6 +187,8 @@ Panel {
   function clearResults() {
     files = []
     pendingFiles = []
+    scanValidated = []
+    commitPending = false
     fileData = ({})
     taskList = []
     displayList = []
@@ -194,6 +206,8 @@ Panel {
     scanCapped = false
     statusText = ""
     pendingFiles = []
+    scanValidated = []
+    commitPending = false
     // Stop any in-flight enumeration first: its entries would otherwise be
     // validated against the NEW todosPath and its stderr could abort THIS
     // scan. Dropping the connection also discards cross-generation output.
@@ -223,8 +237,11 @@ Panel {
     }
     if (pendingFiles.some(function (f) { return f.name === name })) return
     pendingFiles.push({ name: name, path: p })
-    // Stat the exact path find reported, not a reconstructed one.
-    statProc.run(name, p, "discover", scanGen)
+    // Stat the exact path find reported, not a reconstructed one. The request
+    // goes through the shared queue: discovery must not run statProc directly
+    // while a queued reload stat is in flight (that would overwrite the
+    // in-flight stat's name/mode/gen).
+    statRequest(name, p, "discover", scanGen)
   }
 
   // stat -c '%F:%s' with no dereference: a symlink is reported as
@@ -247,23 +264,31 @@ Panel {
       return // symlink / non-regular / too large: never watched
     }
     if (!pendingFiles.some(function (f) { return f.name === name })) return
-    // Only now create the watch/read view for this path.
+    // Passed the gate: record it for the commit (deduped) and only now create
+    // the watch/read view for this path. Files already listed from a previous
+    // generation keep their existing view.
+    var rec = { name: name, path: todosPath + "/" + name }
+    if (!scanValidated.some(function (f) { return f.name === name }))
+      scanValidated.push(rec)
+    if (files.some(function (f) { return f.name === name })) return
     var next = files.slice()
-    next.push({ name: name, path: todosPath + "/" + name })
+    next.push(rec)
     files = next
   }
 
   function commitFileList() {
     if (scanAborted) return
-    // find exit code 1 usually means a raced deletion; stderr already flagged
-    // real problems. Keep the previously validated list on abnormal exits.
-    var key = pendingFiles.map(function (f) { return f.name }).join("\u0001")
+    // Runs ONLY from statPump(), once find has exited (0/capped) and the stat
+    // queue has drained — every candidate has had its queued check by then.
+    // Publish the stat-validated set, never pendingFiles (raw find output):
+    // failed or still-unchecked candidates must not reach the Instantiator.
+    var key = scanValidated.map(function (f) { return f.name }).join("\u0001")
     if (key === filesKey) return
     filesKey = key
-    files = pendingFiles
-    // Drop data/views for files that disappeared.
+    files = scanValidated.slice()
+    // Drop data/views for files that disappeared or no longer pass the gate.
     var present = {}
-    for (var i = 0; i < pendingFiles.length; i++) present[pendingFiles[i].name] = true
+    for (var i = 0; i < scanValidated.length; i++) present[scanValidated[i].name] = true
     var removed = false
     for (var k in fileData) if (!present[k]) { removeFile(k); removed = true }
     if (removed) recompute()
@@ -280,15 +305,38 @@ Panel {
 
   function toggleTask(task) {
     var view = views[task.file]
-    if (view) {
-      var next = Model.toggleTaskIn(String(view.text() || ""), task.line)
-      if (next !== null) {
-        view.setText(next)
-        setFile(task.file, task.path, next)
-        return
-      }
-    }
-    refresh()
+    if (!view) { refresh(); return }
+    // Compare-and-swap on the raw view line: expected = exactly what the
+    // popup rendered, replacement = the same line with the checkbox flipped.
+    var lines = String(view.text() || "").split("\n")
+    if (task.line < 0 || task.line >= lines.length) { refresh(); return }
+    var expected = lines[task.line]
+    var toggled = Model.toggleTaskLine(expected)
+    if (toggled === null) { refresh(); return }
+    lines[task.line] = toggled
+    // The write goes through replace-line.sh, NOT view.setText(): QSaveFile
+    // (Quickshell's atomicWrites) resolves an existing symlink before
+    // choosing the write target, so a peer-planted symlink at task.path
+    // would be written through. The helper lstat-checks target and parent,
+    // verifies the expected line, then stages + renames (see that file).
+    // Writes are queued: replaceProc is a single reusable Process, and a
+    // second run() while one is in flight would be dropped.
+    replaceQueue.push({
+      name: task.file, path: task.path, content: lines.join("\n"),
+      target: task.path, lineno: task.line, expected: expected, toggled: toggled
+    })
+    replacePump()
+  }
+
+  // --- replace serialization -------------------------------------------------
+  property var replaceQueue: []
+  function replacePump() {
+    if (replaceProc.running || replaceQueue.length === 0) return
+    var req = replaceQueue.shift()
+    replaceProc.name = req.name
+    replaceProc.path = req.path
+    replaceProc.content = req.content
+    replaceProc.run(req.target, req.lineno, req.expected, req.toggled)
   }
 
   function addTask(text) {
@@ -298,20 +346,13 @@ Panel {
     if (!root.configured || vaultPending || todosPath === "" || t === null) return
     var line = "- [ ] " + t
     var path = todosPath + "/" + inboxFile
-    // Preferred write path: no shell at all. appendTask + setText goes
-    // through FileView's atomicWrites (temp file + rename), so a planted
-    // inbox.md symlink is replaced rather than written through and nothing
-    // is passed through bash.
-    var view = views[inboxFile]
-    if (view && view.loaded) {
-      view.setText(Model.appendTask(String(view.text() || ""), t))
-      setFile(inboxFile, path, Model.appendTask(view && view.loaded ? String(view.text() || "") : "", t))
-      return
-    }
-    // Fallback: symlink-safe staged rename via add-task.sh (see that file).
-    // A swapped Todos/ directory or a symlinked inbox.md is refused
-    // (O_NOFOLLOW-equivalent); junk in argv is inert because nothing is
-    // expanded by a shell.
+    // ALL writes go through the staged-rename helper, loaded view or not.
+    // The old in-process setText() path relied on FileView.atomicWrites,
+    // but Quickshell implements that with QSaveFile, which resolves an
+    // existing symlink before choosing the write target — a planted
+    // inbox.md symlink would be written through. add-task.sh lstat-checks
+    // the target and parent and renames over the target instead; argv-only,
+    // so junk in the task text is inert.
     addProc.run(line, path)
   }
 
@@ -385,7 +426,12 @@ Panel {
     onExited: function(exitCode) {
       // exitCode 0 = full scan; scanCapped = we stopped it at the cap.
       // Anything else (aborted/error) keeps the previously validated list.
-      if (exitCode === 0 || root.scanCapped) root.commitFileList()
+      // The commit itself waits for the stat queue to drain (statPump
+      // performs it) — every candidate must be checked before publishing.
+      if (exitCode === 0 || root.scanCapped) {
+        root.commitPending = true
+        root.statPump()
+      }
     }
   }
 
@@ -407,9 +453,17 @@ Panel {
     statPump()
   }
   function statPump() {
-    if (statProc.running || statQueue.length === 0) return
-    var req = statQueue.shift()
-    statProc.run(req.name, req.path, req.mode, req.gen)
+    if (statProc.running) return
+    if (statQueue.length > 0) {
+      var req = statQueue.shift()
+      statProc.run(req.name, req.path, req.mode, req.gen)
+      return
+    }
+    // Queue drained: if find has finished, publish the validated set now.
+    if (commitPending) {
+      commitPending = false
+      commitFileList()
+    }
   }
 
   // Validates one candidate path at a time. No shell: arguments are passed as
@@ -439,9 +493,9 @@ Panel {
     onExited: root.statPump()
   }
 
-  // Quick-add fallback write (used when the inbox FileView is not loaded):
-  // stage in a private temp file, then rename over the target. No `>>`
-  // redirection anywhere — that would follow symlinks. See add-task.sh.
+  // Quick-add write: stage in a private temp file, then rename over the
+  // target (every quick-add goes through here). No `>>` redirection
+  // anywhere — that would follow symlinks. See add-task.sh.
   Process {
     id: addProc
     function run(line, path) {
@@ -451,6 +505,32 @@ Panel {
     onExited: function(exitCode) {
       if (exitCode === 0) root.refresh()
       else root.statusText = "could not add task"
+    }
+    stderr: StdioCollector { waitForEnd: true }
+  }
+
+  // Checkbox-toggle write: single-line compare-and-swap through
+  // replace-line.sh — the same staged-rename pattern as addProc, plus the
+  // expected-line check so an edit from a sync peer is refused rather than
+  // overwritten. Success updates the parsed state optimistically (the
+  // watch-triggered reload then confirms from disk); failure resyncs.
+  Process {
+    id: replaceProc
+    property string name: ""
+    property string path: ""
+    property string content: ""
+    function run(target, lineno, expected, replacement) {
+      command = ["bash", Qt.resolvedUrl("replace-line.sh").replace("file://", ""), target, String(lineno), expected, replacement]
+      running = true
+    }
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        root.setFile(replaceProc.name, replaceProc.path, replaceProc.content)
+      } else {
+        root.statusText = "could not save task"
+        root.refresh() // CAS mismatch or swapped path: resync the view
+      }
+      root.replacePump() // drain any queued toggles
     }
     stderr: StdioCollector { waitForEnd: true }
   }
