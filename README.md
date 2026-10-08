@@ -128,6 +128,9 @@ is canonicalized (`~` expanded, trailing slashes removed) and must be absolute.
 - **Bar** — shows the open count; `✓` when all clear, `!` when unconfigured.
 - **Click** the widget to open the popup: check tasks off, add a new one, or
   set the vault path on first run.
+- **Hover** a task row: ✎ edits it inline (Enter saves, clicking away
+  cancels — the due date is prefilled so a plain edit keeps 📅); ✕ deletes
+  it on a second confirming click.
 - **Quick-add / agents** — append a task without opening the popup:
 
   ```bash
@@ -186,6 +189,12 @@ consume bounded resources.
   resolves an existing symlink before choosing the write target.
 - `replace-line.sh` compare-and-swaps: line *N* must still match what the
   popup rendered, so an edit from a sync peer is refused, never overwritten.
+  `remove-line.sh` does the same for deletes (a concurrently edited line is
+  refused, not deleted).
+- Task text — quick-add input and the expected/replacement lines — travels
+  to the helpers on **stdin**, never in process arguments: argv is readable
+  by every local user via `/proc/<pid>/cmdline` (`ps`), a pipe by nobody but
+  the process itself.
 - A symlinked target is **refused**, never written through; the parent
   directory must be a real directory at rename time, so a swapped `Todos/`
   symlink can't redirect the write outside the vault.
@@ -208,7 +217,8 @@ omarchy-todos/
 ├── Model.js        # markdown parsing + path/stat validators (pure JS, node-testable)
 ├── Panel.qml       # bar widget + popup
 ├── add-task.sh     # fail-closed atomic quick-add write (used by Panel.qml)
-├── replace-line.sh # fail-closed compare-and-swap checkbox toggle (Panel.qml)
+├── replace-line.sh # fail-closed compare-and-swap line write (Panel.qml)
+├── remove-line.sh  # fail-closed compare-and-swap line delete (Panel.qml)
 ├── test/           # model.test.js + adversarial vault-fixture.sh
 └── README.md
 ```
@@ -217,7 +227,7 @@ omarchy-todos/
 
 ```bash
 node test/model.test.js       # validator unit tests
-bash test/vault-fixture.sh    # adversarial filesystem fixture (39 checks)
+bash test/vault-fixture.sh    # adversarial filesystem fixture (50 checks)
 ```
 
 To develop locally, clone a working copy into `~/.config/omarchy/plugins/`.

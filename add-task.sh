@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Atomic, symlink-safe task append used by the todos plugin's quick-add.
-# usage: add-task.sh <task-line> <target-file>
+# usage: add-task.sh <target-file>        (task line arrives on stdin, one line)
+#
+# The task text travels on STDIN, never in argv: argv lives in
+# /proc/<pid>/cmdline, which every local user can read (`ps`), so a task
+# line passed as an argument would be private-vault content on display.
 #
 # Why not `echo "$1" >> "$2"`? Shell redirection opens the target *through*
 # any symlink in every path component, so a planted inbox.md symlink (or a
@@ -23,8 +27,13 @@
 # which resolves an existing symlink before choosing the write target.
 set -u
 
-line=$1
-target=$2
+target=$1
+
+# One line from stdin (IFS= keeps leading/trailing spaces, -r keeps
+# backslashes; only the trailing newline is consumed). No stdin line at all
+# (closed channel, empty write) is refused.
+IFS= read -r line || exit 1
+[ -n "$line" ] || exit 1
 
 tmp=$(mktemp "/tmp/.todos-XXXXXX") || exit 1
 

@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Atomic, symlink-safe single-line replacement used by the todos plugin's
 # checkbox toggle (the only write path besides add-task.sh's append).
-# usage: replace-line.sh <target-file> <line-no-0-based> <expected-line> <replacement-line>
+# usage: replace-line.sh <target-file> <line-no-0-based>
+#        stdin: line 1 = expected-line, line 2 = replacement-line
+#
+# Both lines travel on STDIN, never in argv: argv lives in
+# /proc/<pid>/cmdline, which every local user can read (`ps`), so existing
+# and replacement vault-task lines passed as arguments would be private
+# content on display.
 #
 # The QML layer cannot use FileView.setText() for writes: Quickshell
 # implements atomicWrites with QSaveFile, and QSaveFile resolves an
@@ -30,8 +36,11 @@ set -u
 
 target=$1
 lineno=$2
-expected=$3
-replacement=$4
+
+# Expected and replacement lines come from stdin, one per line (IFS= keeps
+# leading/trailing spaces, -r keeps backslashes). Both must be present.
+IFS= read -r expected || exit 1
+IFS= read -r replacement || exit 1
 
 # lineno must be a non-negative integer (0-based, matching Model.parseTasks)
 # and short enough that bash arithmetic cannot overflow.

@@ -21,6 +21,7 @@ check_exit() {
 here=$(cd "$(dirname "$0")/.." && pwd)
 script="$here/add-task.sh"
 rscript="$here/replace-line.sh"
+dscript="$here/remove-line.sh"
 T=$(mktemp -d /tmp/todos-fixture-XXXXXX)
 trap 'rm -rf "$T"' EXIT
 
@@ -31,21 +32,24 @@ line="- [ ] planted"
 # --- T1: normal append ------------------------------------------------------
 note "T1 normal append"
 printf -- '- [ ] existing\n' > "$target"
-bash "$script" "$line" "$target" 2>/dev/null
+printf '%s
+' "$line" | bash "$script" "$target" 2>/dev/null
 check_exit 0 $? "append to existing file"
 grep -q -- '- \[ \] planted' "$target" && ok "new task present" || bad "new task missing"
 
 # --- T2: missing trailing newline gets fixed, not corrupted -----------------
 note "T2 missing trailing newline"
 printf -- '- [ ] a' > "$target"
-bash "$script" "$line" "$target" 2>/dev/null
+printf '%s
+' "$line" | bash "$script" "$target" 2>/dev/null
 check_exit 0 $? "append without trailing newline"
 [ "$(tail -n 1 "$target")" = "$line" ] && ok "task on its own line" || bad "line corrupted"
 
 # --- T3: fresh target --------------------------------------------------------
 note "T3 fresh target"
 rm -f "$target"
-bash "$script" "$line" "$target" 2>/dev/null
+printf '%s
+' "$line" | bash "$script" "$target" 2>/dev/null
 check_exit 0 $? "create new inbox"
 [ "$(cat "$target")" = "$line" ] && ok "content exact" || bad "content wrong"
 
@@ -54,7 +58,8 @@ note "T4 symlinked target refused"
 rm -f "$target"
 printf 'SECRET\n' > "$T/outside/secret.md"
 ln -s "$T/outside/secret.md" "$target"
-bash "$script" "$line" "$target" 2>/dev/null
+printf '%s
+' "$line" | bash "$script" "$target" 2>/dev/null
 check_exit 1 $? "symlink target refused"
 [ "$(cat "$T/outside/secret.md")" = "SECRET" ] && ok "outside file untouched" || bad "outside file written"
 [ -L "$target" ] && ok "symlink left in place" || bad "symlink clobbered"
@@ -64,7 +69,8 @@ note "T5 newline filename"
 nt="$T/vault/Todos/weird
 filename.md"
 printf -- '- [ ] n1\n' > "$nt"
-bash "$script" "- [ ] n2" "$nt" 2>/dev/null
+printf '%s
+' "- [ ] n2" | bash "$script" "$nt" 2>/dev/null
 check_exit 0 $? "append to newline-named file"
 grep -q -- '- \[ \] n2' "$nt" && ok "newline filename handled" || bad "newline filename broken"
 
@@ -72,20 +78,23 @@ grep -q -- '- \[ \] n2' "$nt" && ok "newline filename handled" || bad "newline f
 note "T6 symlinked Todos dir refused"
 mkdir -p "$T/vaultB"
 ln -s "$T/outside/realTodos" "$T/vaultB/Todos"
-bash "$script" "$line" "$T/vaultB/Todos/todo.md" 2>/dev/null
+printf '%s
+' "$line" | bash "$script" "$T/vaultB/Todos/todo.md" 2>/dev/null
 check_exit 1 $? "symlinked parent dir refused"
 [ -z "$(ls -A "$T/outside/realTodos")" ] && ok "nothing written outside" || bad "wrote outside vault"
 
 # --- T7: missing parent directory refused -----------------------------------
 note "T7 missing parent refused"
-bash "$script" "$line" "$T/nonexistent/dir/todo.md" 2>/dev/null
+printf '%s
+' "$line" | bash "$script" "$T/nonexistent/dir/todo.md" 2>/dev/null
 check_exit 1 $? "missing parent refused"
 
 # --- T8: symlinked parent below the target refused ---------------------------
 note "T8 symlinked subpath parent refused"
 mkdir -p "$T/vault/sub"
 ln -s "$T/outside" "$T/vault/sub/down"
-bash "$script" "$line" "$T/vault/sub/down/evil.md" 2>/dev/null
+printf '%s
+' "$line" | bash "$script" "$T/vault/sub/down/evil.md" 2>/dev/null
 check_exit 1 $? "symlinked subpath refused"
 if ls -A "$T/outside" | grep -q '^evil'; then bad "file created outside"; else ok "no file created outside"; fi
 
@@ -93,7 +102,8 @@ if ls -A "$T/outside" | grep -q '^evil'; then bad "file created outside"; else o
 note "T9 FIFO target refused"
 rm -f "$target"
 mkfifo "$target"
-bash "$script" "$line" "$target" 2>/dev/null
+printf '%s
+' "$line" | bash "$script" "$target" 2>/dev/null
 check_exit 1 $? "FIFO target refused"
 [ -p "$target" ] && ok "FIFO untouched" || bad "FIFO clobbered"
 
@@ -101,7 +111,8 @@ check_exit 1 $? "FIFO target refused"
 note "T10 hostile task text"
 rm -f "$target"
 printf -- '- [ ] x\n' > "$target"
-bash "$script" '$(reboot) `id` ; rm -rf /tmp/zzz ; " && | < > >' "$target" 2>/dev/null
+printf '%s
+' '$(reboot) `id` ; rm -rf /tmp/zzz ; " && | < > >' | bash "$script" "$target" 2>/dev/null
 check_exit 0 $? "hostile text append"
 grep -qF '$(reboot) `id` ; rm -rf /tmp/zzz ; " && | < > >' "$target" \
   && ok "task text stored verbatim" || bad "task text mangled or executed"
@@ -111,7 +122,8 @@ note "T11 permissions preserved"
 rm -f "$target"
 printf -- '- [ ] x\n' > "$target"
 chmod 644 "$target"
-bash "$script" "$line" "$target" 2>/dev/null
+printf '%s
+' "$line" | bash "$script" "$target" 2>/dev/null
 [ "$(stat -c %a "$target")" = "644" ] && ok "mode kept" || bad "mode changed to $(stat -c %a "$target")"
 
 # --- T12: oversized file rejected by Model.parseStatPayload ------------------
@@ -128,7 +140,8 @@ node -e '
 # --- T13: normal line replace (CAS pass) -------------------------------------
 note "T13 replace-line CAS pass"
 printf -- '- [ ] one\n- [ ] two\n- [x] three\n' > "$target"
-bash "$rscript" "$target" 1 '- [ ] two' '- [x] two' 2>/dev/null
+printf '%s
+' '- [ ] two' '- [x] two' | bash "$rscript" "$target" 1 2>/dev/null
 check_exit 0 $? "replace accepted"
 [ "$(sed -n 2p "$target")" = '- [x] two' ] && ok "line flipped" || bad "line not flipped"
 grep -qx -- '- \[ \] one' "$target" && ok "other lines intact" || bad "other lines changed"
@@ -138,7 +151,8 @@ note "T14 replace-line symlinked target refused"
 rm -f "$target"
 printf 'SECRET2\n' > "$T/outside/secret2.md"
 ln -s "$T/outside/secret2.md" "$target"
-bash "$rscript" "$target" 0 'SECRET2' 'PWNED' 2>/dev/null
+printf '%s
+' 'SECRET2' 'PWNED' | bash "$rscript" "$target" 0 2>/dev/null
 check_exit 1 $? "symlink replace refused"
 [ "$(cat "$T/outside/secret2.md")" = "SECRET2" ] && ok "outside file untouched" || bad "outside file written"
 [ -L "$target" ] && ok "symlink left in place" || bad "symlink clobbered"
@@ -147,39 +161,85 @@ check_exit 1 $? "symlink replace refused"
 note "T15 replace-line symlinked parent refused"
 rm -f "$target"
 printf -- '- [ ] t\n' > "$T/outside/realTodos/todo.md"
-bash "$rscript" "$T/vaultB/Todos/todo.md" 0 '- [ ] t' '- [x] t' 2>/dev/null
+printf '%s
+' '- [ ] t' '- [x] t' | bash "$rscript" "$T/vaultB/Todos/todo.md" 0 2>/dev/null
 check_exit 1 $? "symlinked parent refused"
 [ "$(cat "$T/outside/realTodos/todo.md")" = '- [ ] t' ] && ok "outside content untouched" || bad "outside content changed"
 
 # --- T16: CAS mismatch refused (file changed under us) -----------------------
 note "T16 CAS mismatch refused"
 printf -- '- [ ] orig\n' > "$target"
-bash "$rscript" "$target" 0 '- [ ] DIFFERENT' '- [x] orig' 2>/dev/null
+printf '%s
+' '- [ ] DIFFERENT' '- [x] orig' | bash "$rscript" "$target" 0 2>/dev/null
 check_exit 1 $? "stale expected refused"
 [ "$(cat "$target")" = '- [ ] orig' ] && ok "file untouched" || bad "file overwritten"
 
 # --- T17: bad line numbers refused -------------------------------------------
 note "T17 line number guards"
 printf -- '- [ ] only\n' > "$target"
-bash "$rscript" "$target" abc '- [ ] only' '- [x] only' 2>/dev/null
+printf '%s
+' '- [ ] only' '- [x] only' | bash "$rscript" "$target" abc 2>/dev/null
 check_exit 1 $? "non-numeric lineno refused"
-bash "$rscript" "$target" 99 '- [ ] only' '- [x] only' 2>/dev/null
+printf '%s
+' '- [ ] only' '- [x] only' | bash "$rscript" "$target" 99 2>/dev/null
 check_exit 1 $? "out-of-range lineno refused"
 [ "$(cat "$target")" = '- [ ] only' ] && ok "file untouched" || bad "file changed"
 
 # --- T18: CRLF line endings compared and round-tripped -----------------------
 note "T18 CRLF preserved"
 printf -- '- [ ] one\r\n- [ ] two\r\n' > "$target"
-bash "$rscript" "$target" 1 $'- [ ] two\r' $'- [x] two\r' 2>/dev/null
+printf '%s
+' $'- [ ] two\r' $'- [x] two\r' | bash "$rscript" "$target" 1 2>/dev/null
 check_exit 0 $? "CRLF CAS accepted"
 grep -qF -- $'- [x] two\r' "$target" && ok "CR kept on replaced line" || bad "CR lost"
 
 # --- T19: hostile replacement text inert (argv, no shell) ---------------------
 note "T19 hostile replacement text"
 printf -- '- [ ] x\n' > "$target"
-bash "$rscript" "$target" 0 '- [ ] x' '$(reboot) `id` ; rm -rf /tmp/zzz' 2>/dev/null
+printf '%s
+' '- [ ] x' '$(reboot) `id` ; rm -rf /tmp/zzz' | bash "$rscript" "$target" 0 2>/dev/null
 check_exit 0 $? "hostile replacement accepted"
 grep -qF -- '$(reboot) `id` ; rm -rf /tmp/zzz' "$target" && ok "stored verbatim" || bad "mangled or executed"
+
+# --- T20: task text never taken from argv (stdin-only interface) -------------
+note "T20 argv text refused"
+rm -f "$target"
+printf -- '- [ ] keep\n' > "$target"
+bash "$script" 'ARGV-LEAK' "$target" < /dev/null 2>/dev/null
+check_exit 1 $? "argv text with empty stdin refused"
+grep -q 'ARGV-LEAK' "$target" && bad "argv text leaked into file" || ok "nothing written from argv"
+
+# --- T21: remove-line CAS pass ------------------------------------------------
+note "T21 remove-line CAS pass"
+printf -- '- [ ] one\n- [ ] two\n- [x] three\n' > "$target"
+printf '%s\n' '- [ ] two' | bash "$dscript" "$target" 1 2>/dev/null
+check_exit 0 $? "delete accepted"
+[ "$(cat "$target")" = $'- [ ] one\n- [x] three' ] && ok "line removed, others intact" || bad "content wrong after delete"
+
+# --- T22: remove-line CAS mismatch refused -----------------------------------
+note "T22 remove-line CAS mismatch refused"
+printf -- '- [ ] orig\n' > "$target"
+printf '%s\n' '- [ ] NOT-THIS' | bash "$dscript" "$target" 0 2>/dev/null
+check_exit 1 $? "stale expected refused"
+[ "$(cat "$target")" = '- [ ] orig' ] && ok "file untouched" || bad "file overwritten"
+
+# --- T23: remove-line via symlinked target refused ---------------------------
+note "T23 remove-line symlinked target refused"
+rm -f "$target"
+printf 'SECRET3\n' > "$T/outside/secret3.md"
+ln -s "$T/outside/secret3.md" "$target"
+printf '%s\n' 'SECRET3' | bash "$dscript" "$target" 0 2>/dev/null
+check_exit 1 $? "symlink delete refused"
+[ "$(cat "$T/outside/secret3.md")" = "SECRET3" ] && ok "outside file untouched" || bad "outside file modified"
+[ -L "$target" ] && ok "symlink left in place" || bad "symlink clobbered"
+
+# --- T24: deleting the only line leaves an empty file ------------------------
+note "T24 delete last line"
+rm -f "$target"
+printf -- '- [ ] solo\n' > "$target"
+printf '%s\n' '- [ ] solo' | bash "$dscript" "$target" 0 2>/dev/null
+check_exit 0 $? "delete last line accepted"
+[ -s "$target" ] && bad "file should be empty" || ok "file empty, no stray newline"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

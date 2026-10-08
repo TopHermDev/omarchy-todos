@@ -145,4 +145,20 @@ t("stat: malformed payloads abort-worthy", function () {
   assert.strictEqual(m.parseStatPayload("", CAP).reason, "unparsable stat output")
 })
 
+// ---- editTaskLine (popup edit action) ----------------------------------------
+t("editTaskLine: prefix and done state preserved", function () {
+  assert.strictEqual(m.editTaskLine("  * [x] old body", "new body"), "  * [x] new body")
+  assert.strictEqual(m.editTaskLine("- [ ] a", "b"), "- [ ] b")
+})
+t("editTaskLine: text flattened and capped", function () {
+  assert.strictEqual(m.editTaskLine("- [ ] a", "one\ntwo"), "- [ ] one two")
+  assert.strictEqual(m.editTaskLine("- [ ] a", ""), null, "empty edit refused")
+  assert.strictEqual(m.editTaskLine("- [ ] a", "x".repeat(600)), null, "overlong edit refused")
+})
+t("editTaskLine: non-task lines and bad input refused", function () {
+  assert.strictEqual(m.editTaskLine("not a task", "x"), null)
+  assert.strictEqual(m.editTaskLine("", "x"), null)
+  assert.strictEqual(m.editTaskLine(null, "x"), null)
+})
+
 console.log("\n" + passed + " passed")

@@ -138,6 +138,19 @@ function toggleTaskIn(markdown, lineNumber) {
   return lines.join("\n")
 }
 
+// Replace a task line's body while preserving its exact prefix: leading
+// whitespace, bullet, checkbox mark (done state) and spacing after `]`.
+// The new text is flattened and capped like quick-add input. Returns the
+// full new line, or null when the line isn't a checkbox task or the text
+// is unusable. Used by the popup's edit action (replace-line.sh writes it).
+function editTaskLine(line, text) {
+  var m = CHECKBOX.exec(String(line == null ? "" : line))
+  if (!m) return null
+  var s = sanitizeTaskText(text, MAX_TASK_LENGTH)
+  if (s === null) return null
+  return m[1] + m[2] + m[3] + s
+}
+
 function appendTask(markdown, text) {
   var base = String(markdown || "")
   var line = "- [ ] " + String(text || "").replace(/\r?\n/g, " ")
@@ -165,6 +178,7 @@ if (typeof module !== "undefined") {
     dueDate: dueDate,
     toggleTaskLine: toggleTaskLine,
     toggleTaskIn: toggleTaskIn,
+    editTaskLine: editTaskLine,
     appendTask: appendTask,
     sanitizeTaskText: sanitizeTaskText,
     dateKey: dateKey,
