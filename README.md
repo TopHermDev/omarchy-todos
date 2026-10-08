@@ -194,7 +194,8 @@ consume bounded resources.
 - Task text — quick-add input and the expected/replacement lines — travels
   to the helpers on **stdin**, never in process arguments: argv is readable
   by every local user via `/proc/<pid>/cmdline` (`ps`), a pipe by nobody but
-  the process itself.
+  the process itself. The reads are bounded (`read -t 10`), so a helper whose
+  caller died before writing exits instead of blocking forever.
 - A symlinked target is **refused**, never written through; the parent
   directory must be a real directory at rename time, so a swapped `Todos/`
   symlink can't redirect the write outside the vault.
@@ -227,7 +228,7 @@ omarchy-todos/
 
 ```bash
 node test/model.test.js       # validator unit tests
-bash test/vault-fixture.sh    # adversarial filesystem fixture (50 checks)
+bash test/vault-fixture.sh    # adversarial filesystem fixture (54 checks)
 ```
 
 To develop locally, clone a working copy into `~/.config/omarchy/plugins/`.

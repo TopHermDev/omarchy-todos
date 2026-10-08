@@ -399,9 +399,21 @@ Panel {
     // but Quickshell implements that with QSaveFile, which resolves an
     // existing symlink before choosing the write target — a planted
     // inbox.md symlink would be written through. add-task.sh lstat-checks
-    // the target and parent and renames over the target instead; argv-only,
-    // so junk in the task text is inert.
-    addProc.run(line, path)
+    // the target and parent and renames over the target instead; the task
+    // line rides stdin, so junk text never touches argv at all.
+    // Queued like every other write: addProc is a single reusable Process,
+    // and a second run() while one is in flight would be dropped
+    // (running=true would be a no-op, so pendingInput never gets written).
+    addQueue.push({ line: line, path: path })
+    addPump()
+  }
+
+  // --- add serialization -----------------------------------------------------
+  property var addQueue: []
+  function addPump() {
+    if (addProc.running || addQueue.length === 0) return
+    var req = addQueue.shift()
+    addProc.run(req.line, req.path)
   }
 
   function submitQuick() {
@@ -565,6 +577,7 @@ Panel {
     onExited: function(exitCode) {
       if (exitCode === 0) root.refresh()
       else root.statusText = "could not add task"
+      root.addPump() // drain any queued quick-adds
     }
     stderr: StdioCollector { waitForEnd: true }
   }

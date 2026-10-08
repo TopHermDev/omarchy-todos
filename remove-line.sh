@@ -29,8 +29,9 @@ target=$1
 lineno=$2
 
 # The expected line comes from stdin (IFS= keeps leading/trailing spaces,
-# -r keeps backslashes). No stdin line = refuse.
-IFS= read -r expected || exit 1
+# -r keeps backslashes). No stdin line = refuse. -t 10 bounds the wait so a
+# helper whose caller died before writing exits instead of blocking forever.
+IFS= read -r -t 10 expected || exit 1
 
 # lineno must be a non-negative integer (0-based, matching Model.parseTasks)
 # and short enough that bash arithmetic cannot overflow.

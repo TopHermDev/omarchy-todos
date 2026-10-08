@@ -241,5 +241,18 @@ printf '%s\n' '- [ ] solo' | bash "$dscript" "$target" 0 2>/dev/null
 check_exit 0 $? "delete last line accepted"
 [ -s "$target" ] && bad "file should be empty" || ok "file empty, no stray newline"
 
+# --- T25: replace-line ignores argv text (stdin-only interface) --------------
+note "T25 replace-line argv text refused"
+printf -- '- [ ] orig\n' > "$target"
+bash "$rscript" "$target" 0 '- [ ] orig' '- [x] orig' < /dev/null 2>/dev/null
+check_exit 1 $? "argv-only replace refused"
+[ "$(cat "$target")" = '- [ ] orig' ] && ok "file untouched" || bad "file changed from argv"
+
+# --- T26: remove-line ignores argv text ---------------------------------------
+note "T26 remove-line argv text refused"
+bash "$dscript" "$target" 0 '- [ ] orig' < /dev/null 2>/dev/null
+check_exit 1 $? "argv-only delete refused"
+[ "$(cat "$target")" = '- [ ] orig' ] && ok "file untouched" || bad "file changed from argv"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -39,8 +39,11 @@ lineno=$2
 
 # Expected and replacement lines come from stdin, one per line (IFS= keeps
 # leading/trailing spaces, -r keeps backslashes). Both must be present.
-IFS= read -r expected || exit 1
-IFS= read -r replacement || exit 1
+# -t 10 bounds the wait so a helper whose caller died before writing exits
+# instead of blocking forever (the caller writes within milliseconds of
+# process start).
+IFS= read -r -t 10 expected || exit 1
+IFS= read -r -t 10 replacement || exit 1
 
 # lineno must be a non-negative integer (0-based, matching Model.parseTasks)
 # and short enough that bash arithmetic cannot overflow.

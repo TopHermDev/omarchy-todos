@@ -31,8 +31,10 @@ target=$1
 
 # One line from stdin (IFS= keeps leading/trailing spaces, -r keeps
 # backslashes; only the trailing newline is consumed). No stdin line at all
-# (closed channel, empty write) is refused.
-IFS= read -r line || exit 1
+# (closed channel, empty write) is refused. -t 10 bounds the wait: the QML
+# caller writes within milliseconds of process start, so a helper whose
+# caller died before writing exits instead of blocking forever.
+IFS= read -r -t 10 line || exit 1
 [ -n "$line" ] || exit 1
 
 tmp=$(mktemp "/tmp/.todos-XXXXXX") || exit 1
