@@ -182,9 +182,11 @@ consume bounded resources.
 
 **Writes (quick-add, checkboxes)**
 
-- Every write goes through a helper — `add-task.sh` (quick-add append) or
-  `replace-line.sh` (checkbox toggle) — as `mktemp` (0600) → write → `mv -f`
-  over the target. The in-process `FileView.setText()` path is deliberately
+- Every write goes through a helper — `add-task.sh` (quick-add append),
+  `replace-line.sh` (checkbox toggle), `remove-line.sh` (delete) — as
+  `mktemp` (0600) → write → `mv -f` over the target, with the target's mode
+  re-applied *after* the rename. The staging file never leaves 0600 while it
+  is in `/tmp`, so a private note is never world-readable there. The in-process `FileView.setText()` path is deliberately
   not used: Quickshell implements `atomicWrites` with `QSaveFile`, which
   resolves an existing symlink before choosing the write target.
 - `replace-line.sh` compare-and-swaps: line *N* must still match what the
@@ -228,7 +230,7 @@ omarchy-todos/
 
 ```bash
 node test/model.test.js       # validator unit tests
-bash test/vault-fixture.sh    # adversarial filesystem fixture (54 checks)
+bash test/vault-fixture.sh    # adversarial filesystem fixture (59 checks)
 ```
 
 To develop locally, clone a working copy into `~/.config/omarchy/plugins/`.

@@ -17,9 +17,11 @@
 #   2. refuses if the target exists and is not a regular file (a planted
 #      inbox.md symlink is neither written through nor read through —
 #      equivalent to open(O_NOFOLLOW) failing with ELOOP)
-#   3. stages the new content in a temp file with the target's permissions
-#      and renames it over the target, so the write is atomic and the final
-#      object is always a regular file inside the vault
+#   3. stages the new content in a 0600 temp file and renames it over the
+#      target, then re-applies the target's mode AFTER the rename — a
+#      loosened staging file in /tmp would be cross-user readable before mv;
+#      the write is atomic and the final object always a regular file
+#      inside the vault
 #
 # Residual TOCTOU between the stat checks and the rename is accepted here;
 # the rename itself never follows a final-component symlink. There is no
@@ -62,9 +64,16 @@ else
   printf '%s\n' "$line" > "$tmp" || { rm -f -- "$tmp"; exit 1; }
 fi
 
-# Keep the target's permission bits (mktemp creates 0600).
-if [ -e "$target" ]; then
-  chmod --reference="$target" -- "$tmp" 2>/dev/null || true
-fi
+# Capture the target's mode BEFORE the swap. The staging file must stay at
+# mktemp's 0600 until it is inside the vault: loosening it to (say) 0644
+# first would expose the whole note to other local accounts through the
+# world-searchable /tmp path in the window before mv. The mode is applied
+# AFTER the rename, where the vault's directory protection already covers
+# it. Fresh targets have no mode to copy and keep mktemp's 0600.
+mode=$(stat -c %a -- "$target" 2>/dev/null || true)
 
 mv -f -- "$tmp" "$target" || { rm -f -- "$tmp"; exit 1; }
+
+if [ -n "$mode" ]; then
+  chmod "$mode" -- "$target" 2>/dev/null || true
+fi

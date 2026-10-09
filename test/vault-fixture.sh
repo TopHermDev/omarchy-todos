@@ -254,5 +254,29 @@ bash "$dscript" "$target" 0 '- [ ] orig' < /dev/null 2>/dev/null
 check_exit 1 $? "argv-only delete refused"
 [ "$(cat "$target")" = '- [ ] orig' ] && ok "file untouched" || bad "file changed from argv"
 
+# --- T27: staging file never loosened before the rename (round 6) -------------
+note "T27 staging stays 0600 until renamed"
+if grep -q 'chmod --reference' "$here/add-task.sh" "$here/replace-line.sh" "$here/remove-line.sh"; then
+  bad "staging file chmod'd to target mode before mv"
+else
+  ok "no pre-rename chmod of staging file"
+fi
+for f in add-task.sh replace-line.sh remove-line.sh; do
+  m=$(grep -n 'mv -f -- "\$tmp"' "$here/$f" | head -1 | cut -d: -f1)
+  c=$(grep -n 'chmod "\$mode"' "$here/$f" | head -1 | cut -d: -f1)
+  if [ -n "$m" ] && [ -n "$c" ] && [ "$c" -gt "$m" ]; then
+    ok "$f: mode applied after rename"
+  else
+    bad "$f: mode order wrong (mv=$m chmod=$c)"
+  fi
+done
+
+# --- T28: replace-line still preserves the target's mode ----------------------
+note "T28 replace-line preserves target mode"
+printf -- '- [ ] m\n' > "$target"
+chmod 640 "$target"
+printf '%s\n' '- [ ] m' '- [x] m' | bash "$rscript" "$target" 0 2>/dev/null
+[ "$(stat -c %a "$target")" = "640" ] && ok "640 kept after replace" || bad "mode now $(stat -c %a "$target")"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -16,8 +16,9 @@
 #   3. compare-and-swaps: line <n> must still exactly equal <expected-line>,
 #      so an edit from a sync peer is refused, not overwritten by a stale
 #      delete
-#   4. stages the remaining content in a temp file with the target's
-#      permissions and renames it over the target
+#   4. stages the remaining content in a 0600 temp file, renames it over
+#      the target, then re-applies the target's mode AFTER the rename (a
+#      loosened staging file in /tmp would be cross-user readable before mv)
 #
 # Lines are compared after the shell strips only the trailing newline (CR
 # bytes are kept), so CRLF files compare and round-trip unchanged. Residual
@@ -72,7 +73,17 @@ if [ "${#lines[@]}" -gt 0 ]; then
   printf '%s\n' "${lines[@]}" > "$tmp" || { rm -f -- "$tmp"; exit 1; }
 fi
 
-# Keep the target's permission bits (mktemp creates 0600).
-chmod --reference="$target" -- "$tmp" 2>/dev/null || true
+# Capture the target's mode BEFORE the swap. The staging file must stay at
+# mktemp's 0600 until it is inside the vault: loosening it to (say) 0644
+# first would expose the whole note to other local accounts through the
+# world-searchable /tmp path in the window before mv. The mode is applied
+# AFTER the rename, where the vault's directory protection already covers
+# it (the mode itself is still read from the pre-swap target — same
+# accepted TOCTOU class as the checks above, bounded to a permission byte).
+mode=$(stat -c %a -- "$target" 2>/dev/null || true)
 
 mv -f -- "$tmp" "$target" || { rm -f -- "$tmp"; exit 1; }
+
+if [ -n "$mode" ]; then
+  chmod "$mode" -- "$target" 2>/dev/null || true
+fi
