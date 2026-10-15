@@ -14,14 +14,26 @@ import "Model.js" as Model
 //    path confirms a regular file under the size cap. Only then is the
 //    FileView for that path created. Every watch-triggered reload re-runs the
 //    same checks and keeps the last good data if validation fails.
-//  - Task writes never touch the shell for redirection (which would follow a
-//    planted inbox.md symlink). The file is staged under mktemp and renamed
-//    over the target; atomicWrites does the same, so a symlinked inbox.md or
-//    a swapped Todos/ directory is *replaced* (still inside the vault), never
-//    written through.
-// Residual TOCTOU between stat and load is inherent to the QML toolset; the
-// reload re-validation and hard size cap bound what an attacker can achieve
-// through it. A native backend (open/fstat/O_NOFOLLOW) would close it fully.
+//  - Discovery candidates only reach the file list after their queued stat
+//    has passed, and commitFileList() runs only once find has exited and the
+//    stat queue has drained: it publishes the stat-validated set, so raw find
+//    output never becomes a FileView.
+//  - Task writes never go through FileView.setText()/QSaveFile (it resolves
+//    an existing symlink before choosing the write target) and never through
+//    shell redirection (follows symlinks in every path component). Every
+//    write goes through a helper (add-task.sh / replace-line.sh /
+//    remove-line.sh) that lstat-checks the target and its parent, then
+//    stages under mktemp and renames over the target: a planted inbox.md
+//    symlink or a swapped Todos/ directory is *replaced* (still inside the
+//    vault), never written through.
+//  - Task text (quick-add input, expected/replacement lines) travels to the
+//    helpers on STDIN, never in process arguments: argv is readable by
+//    every local user via /proc/<pid>/cmdline (`ps`), a pipe by nobody but
+//    the process itself.
+// Residual TOCTOU between stat and load (and between the helpers' checks and
+// their rename) is inherent to this toolset; the reload re-validation and
+// hard size cap bound what an attacker can achieve through it. A native
+// backend (open/fstat/O_NOFOLLOW) would close it fully.
 Panel {
   id: root
   moduleName: "jeanhuit.todos"
@@ -109,9 +121,11 @@ Panel {
   property string nextDue: ""
   property var views: ({})
   property string filesKey: ""
+  property var scanValidated: []    // stat-validated entries of the current scan
   property bool scanAborted: false
   property bool scanCapped: false
   property int scanGen: 0
+  property bool commitPending: false // scan finished; commit once the stat queue drains
   property string statusText: ""
 
   implicitWidth: button.implicitWidth
@@ -243,6 +257,8 @@ Panel {
   function clearResults() {
     files = []
     pendingFiles = []
+    scanValidated = []
+    commitPending = false
     fileData = ({})
     taskList = []
     displayList = []
@@ -269,6 +285,8 @@ Panel {
     scanCapped = false
     statusText = ""
     pendingFiles = []
+    scanValidated = []
+    commitPending = false
     // Stop any in-flight enumeration first: its entries would otherwise be
     // validated against the NEW todosPath and its stderr could abort THIS
     // scan. Dropping the connection also discards cross-generation output.
@@ -298,8 +316,11 @@ Panel {
     }
     if (pendingFiles.some(function (f) { return f.name === name })) return
     pendingFiles.push({ name: name, path: p })
-    // Stat the exact path find reported, not a reconstructed one.
-    statProc.run(name, p, "discover", scanGen)
+    // Stat the exact path find reported, not a reconstructed one. The request
+    // goes through the shared queue: discovery must not run statProc directly
+    // while a queued reload stat is in flight (that would overwrite the
+    // in-flight stat's name/mode/gen).
+    statRequest(name, p, "discover", scanGen)
   }
 
   // stat -c '%F:%s' with no dereference: a symlink is reported as
@@ -322,23 +343,31 @@ Panel {
       return // symlink / non-regular / too large: never watched
     }
     if (!pendingFiles.some(function (f) { return f.name === name })) return
-    // Only now create the watch/read view for this path.
+    // Passed the gate: record it for the commit (deduped) and only now create
+    // the watch/read view for this path. Files already listed from a previous
+    // generation keep their existing view.
+    var rec = { name: name, path: todosPath + "/" + name }
+    if (!scanValidated.some(function (f) { return f.name === name }))
+      scanValidated.push(rec)
+    if (files.some(function (f) { return f.name === name })) return
     var next = files.slice()
-    next.push({ name: name, path: todosPath + "/" + name })
+    next.push(rec)
     files = next
   }
 
   function commitFileList() {
     if (scanAborted) return
-    // find exit code 1 usually means a raced deletion; stderr already flagged
-    // real problems. Keep the previously validated list on abnormal exits.
-    var key = pendingFiles.map(function (f) { return f.name }).join("\u0001")
+    // Runs ONLY from statPump(), once find has exited (0/capped) and the stat
+    // queue has drained — every candidate has had its queued check by then.
+    // Publish the stat-validated set, never pendingFiles (raw find output):
+    // failed or still-unchecked candidates must not reach the Instantiator.
+    var key = scanValidated.map(function (f) { return f.name }).join("\u0001")
     if (key === filesKey) return
     filesKey = key
-    files = pendingFiles
-    // Drop data/views for files that disappeared.
+    files = scanValidated.slice()
+    // Drop data/views for files that disappeared or no longer pass the gate.
     var present = {}
-    for (var i = 0; i < pendingFiles.length; i++) present[pendingFiles[i].name] = true
+    for (var i = 0; i < scanValidated.length; i++) present[scanValidated[i].name] = true
     var removed = false
     for (var k in fileData) if (!present[k]) { removeFile(k); removed = true }
     if (removed) recompute()
@@ -355,15 +384,82 @@ Panel {
 
   function toggleTask(task) {
     var view = views[task.file]
-    if (view) {
-      var next = Model.toggleTaskIn(String(view.text() || ""), task.line)
-      if (next !== null) {
-        view.setText(next)
-        setFile(task.file, task.path, next)
-        return
-      }
-    }
-    refresh()
+    if (!view) { refresh(); return }
+    // Compare-and-swap on the raw view line: expected = exactly what the
+    // popup rendered, replacement = the same line with the checkbox flipped.
+    var lines = String(view.text() || "").split("\n")
+    if (task.line < 0 || task.line >= lines.length) { refresh(); return }
+    var expected = lines[task.line]
+    var toggled = Model.toggleTaskLine(expected)
+    if (toggled === null) { refresh(); return }
+    lines[task.line] = toggled
+    // The write goes through replace-line.sh, NOT view.setText(): QSaveFile
+    // (Quickshell's atomicWrites) resolves an existing symlink before
+    // choosing the write target, so a peer-planted symlink at task.path
+    // would be written through. The helper lstat-checks target and parent,
+    // verifies the expected line, then stages + renames (see that file).
+    // Writes are queued: replaceProc is a single reusable Process, and a
+    // second run() while one is in flight would be dropped.
+    replaceQueue.push({
+      name: task.file, path: task.path, content: lines.join("\n"),
+      target: task.path, lineno: task.line, expected: expected, replacement: toggled
+    })
+    replacePump()
+  }
+
+  // Popup edit: same CAS write as toggle, but the line's body is rebuilt by
+  // Model.editTaskLine (prefix and checkbox mark preserved, text flattened
+  // and capped). newText carries the due date back (the field is prefilled
+  // with it), so editing does not silently drop 📅.
+  function editTask(task, newText) {
+    var view = views[task.file]
+    if (!view) { refresh(); return }
+    var lines = String(view.text() || "").split("\n")
+    if (task.line < 0 || task.line >= lines.length) { refresh(); return }
+    var expected = lines[task.line]
+    var replacement = Model.editTaskLine(expected, newText)
+    if (replacement === null) { statusText = "could not edit task"; return }
+    lines[task.line] = replacement
+    replaceQueue.push({
+      name: task.file, path: task.path, content: lines.join("\n"),
+      target: task.path, lineno: task.line, expected: expected, replacement: replacement
+    })
+    replacePump()
+  }
+
+  // --- replace serialization -------------------------------------------------
+  property var replaceQueue: []
+  function replacePump() {
+    if (replaceProc.running || replaceQueue.length === 0) return
+    var req = replaceQueue.shift()
+    replaceProc.name = req.name
+    replaceProc.path = req.path
+    replaceProc.content = req.content
+    replaceProc.run(req.target, req.lineno, req.expected, req.replacement)
+  }
+
+  // --- delete serialization --------------------------------------------------
+  property var removeQueue: []
+  function removePump() {
+    if (removeProc.running || removeQueue.length === 0) return
+    var req = removeQueue.shift()
+    removeProc.name = req.name
+    removeProc.path = req.path
+    removeProc.run(req.target, req.lineno, req.expected)
+  }
+
+  // Popup delete: remove exactly the rendered line through remove-line.sh
+  // (CAS — a peer's concurrent edit of that line is refused, not deleted).
+  function deleteTask(task) {
+    var view = views[task.file]
+    if (!view) { refresh(); return }
+    var lines = String(view.text() || "").split("\n")
+    if (task.line < 0 || task.line >= lines.length) { refresh(); return }
+    removeQueue.push({
+      name: task.file, path: task.path, target: task.path,
+      lineno: task.line, expected: lines[task.line]
+    })
+    removePump()
   }
 
   function addTask(text) {
@@ -375,22 +471,26 @@ Panel {
     if (!root.configured || vaultPending || todosPath === "") return
     var line = "- [ ] " + t
     var path = todosPath + "/" + inboxFile
-    // Preferred write path: no shell at all. appendTask + setText goes
-    // through FileView's atomicWrites (temp file + rename), so a planted
-    // inbox.md symlink is replaced rather than written through and nothing
-    // is passed through bash.
-    var view = views[inboxFile]
-    if (view && view.loaded) {
-      var next = Model.appendTask(String(view.text() || ""), t)
-      view.setText(next)
-      setFile(inboxFile, path, next) // next, not a re-append of view.text()
-      return
-    }
-    // Fallback: symlink-safe staged rename via add-task.sh (see that file).
-    // A swapped Todos/ directory or a symlinked inbox.md is refused
-    // (O_NOFOLLOW-equivalent); junk in argv is inert because nothing is
-    // expanded by a shell.
-    addProc.run(line, path)
+    // ALL writes go through the staged-rename helper, loaded view or not.
+    // The old in-process setText() path relied on FileView.atomicWrites,
+    // but Quickshell implements that with QSaveFile, which resolves an
+    // existing symlink before choosing the write target — a planted
+    // inbox.md symlink would be written through. add-task.sh lstat-checks
+    // the target and parent and renames over the target instead; the task
+    // line rides stdin, so junk text never touches argv at all.
+    // Queued like every other write: addProc is a single reusable Process,
+    // and a second run() while one is in flight would be dropped
+    // (running=true would be a no-op, so pendingInput never gets written).
+    addQueue.push({ line: line, path: path })
+    addPump()
+  }
+
+  // --- add serialization -----------------------------------------------------
+  property var addQueue: []
+  function addPump() {
+    if (addProc.running || addQueue.length === 0) return
+    var req = addQueue.shift()
+    addProc.run(req.line, req.path)
   }
 
   function submitQuick() {
@@ -466,7 +566,12 @@ Panel {
     onExited: function(exitCode) {
       // exitCode 0 = full scan; scanCapped = we stopped it at the cap.
       // Anything else (aborted/error) keeps the previously validated list.
-      if (exitCode === 0 || root.scanCapped) root.commitFileList()
+      // The commit itself waits for the stat queue to drain (statPump
+      // performs it) — every candidate must be checked before publishing.
+      if (exitCode === 0 || root.scanCapped) {
+        root.commitPending = true
+        root.statPump()
+      }
     }
   }
 
@@ -488,9 +593,17 @@ Panel {
     statPump()
   }
   function statPump() {
-    if (statProc.running || statQueue.length === 0) return
-    var req = statQueue.shift()
-    statProc.run(req.name, req.path, req.mode, req.gen)
+    if (statProc.running) return
+    if (statQueue.length > 0) {
+      var req = statQueue.shift()
+      statProc.run(req.name, req.path, req.mode, req.gen)
+      return
+    }
+    // Queue drained: if find has finished, publish the validated set now.
+    if (commitPending) {
+      commitPending = false
+      commitFileList()
+    }
   }
 
   // Validates one candidate path at a time. No shell: arguments are passed as
@@ -520,18 +633,97 @@ Panel {
     onExited: root.statPump()
   }
 
-  // Quick-add fallback write (used when the inbox FileView is not loaded):
-  // stage in a private temp file, then rename over the target. No `>>`
-  // redirection anywhere — that would follow symlinks. See add-task.sh.
+  // Quick-add write: stage in a private temp file, then rename over the
+  // target (every quick-add goes through here). No `>>` redirection
+  // anywhere — that would follow symlinks. The task line rides stdin,
+  // never argv (see add-task.sh header).
   Process {
     id: addProc
+    stdinEnabled: true
+    property string pendingInput: ""
     function run(line, path) {
-      command = ["bash", Qt.resolvedUrl("add-task.sh").replace("file://", ""), line, path]
+      pendingInput = line + "\n"
+      command = ["bash", Qt.resolvedUrl("add-task.sh").replace("file://", ""), path]
       running = true
+    }
+    onRunningChanged: {
+      // runningChanged is emitted from QProcess::started, so the pipe is
+      // open by now; write() would be a no-op if it were not.
+      if (running && pendingInput !== "") {
+        write(pendingInput)
+        pendingInput = ""
+      }
     }
     onExited: function(exitCode) {
       if (exitCode === 0) root.refresh()
       else root.statusText = "could not add task"
+      root.addPump() // drain any queued quick-adds
+    }
+    stderr: StdioCollector { waitForEnd: true }
+  }
+
+  // Checkbox-toggle / edit write: single-line compare-and-swap through
+  // replace-line.sh — the same staged-rename pattern as addProc, plus the
+  // expected-line check so an edit from a sync peer is refused rather than
+  // overwritten. Expected and replacement lines ride stdin, never argv.
+  // Success updates the parsed state optimistically (the watch-triggered
+  // reload then confirms from disk); failure resyncs.
+  Process {
+    id: replaceProc
+    stdinEnabled: true
+    property string pendingInput: ""
+    property string name: ""
+    property string path: ""
+    property string content: ""
+    function run(target, lineno, expected, replacement) {
+      pendingInput = expected + "\n" + replacement + "\n"
+      command = ["bash", Qt.resolvedUrl("replace-line.sh").replace("file://", ""), target, String(lineno)]
+      running = true
+    }
+    onRunningChanged: {
+      if (running && pendingInput !== "") {
+        write(pendingInput)
+        pendingInput = ""
+      }
+    }
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        root.setFile(replaceProc.name, replaceProc.path, replaceProc.content)
+      } else {
+        // refresh() clears statusText, so set the error AFTER it.
+        root.refresh()
+        root.statusText = "could not save task"
+      }
+      root.replacePump() // drain any queued toggles/edits
+    }
+    stderr: StdioCollector { waitForEnd: true }
+  }
+
+  // Delete write: remove exactly one rendered line through remove-line.sh —
+  // staged-rename + CAS, expected line on stdin. Success rescans (the file
+  // watch would refresh anyway; this keeps the UI prompt even if the watch
+  // is slow); failure resyncs with the error set after refresh().
+  Process {
+    id: removeProc
+    stdinEnabled: true
+    property string pendingInput: ""
+    property string name: ""
+    property string path: ""
+    function run(target, lineno, expected) {
+      pendingInput = expected + "\n"
+      command = ["bash", Qt.resolvedUrl("remove-line.sh").replace("file://", ""), target, String(lineno)]
+      running = true
+    }
+    onRunningChanged: {
+      if (running && pendingInput !== "") {
+        write(pendingInput)
+        pendingInput = ""
+      }
+    }
+    onExited: function(exitCode) {
+      root.refresh()
+      if (exitCode !== 0) root.statusText = "could not delete task"
+      root.removePump() // drain any queued deletes
     }
     stderr: StdioCollector { waitForEnd: true }
   }
@@ -866,6 +1058,35 @@ Panel {
 
       readonly property bool done: modelData.done
       readonly property bool overdue: !modelData.done && modelData.due !== "" && modelData.due < root.todayKey
+      property bool editing: false
+      property bool armDelete: false
+
+      // Edit flow: Enter commits (editTask does the CAS write through
+      // replace-line.sh); clicking elsewhere on the row cancels. Focus loss
+      // alone does NOT clear editing — otherwise blur-then-click would both
+      // cancel and toggle the task.
+      function startEdit() {
+        armDelete = false
+        editing = true
+        // Prefill with the due date so a plain text edit keeps 📅 (the
+        // stored line's body is replaced wholesale).
+        editField.text = modelData.text + (modelData.due !== "" ? " 📅 " + modelData.due : "")
+        editField.forceActiveFocus()
+        editField.selectAll()
+      }
+      function commitEdit() {
+        if (!editing) return
+        var v = editField.text
+        editing = false
+        root.editTask(modelData, v)
+      }
+      function deleteClicked() {
+        // Two-step: first click arms, second confirms. Hover-out or a row
+        // click disarms.
+        if (!armDelete) { armDelete = true; return }
+        armDelete = false
+        root.deleteTask(modelData)
+      }
 
       BorderSurface {
         id: surface
@@ -912,6 +1133,7 @@ Panel {
           width: parent.width - Style.space(18) - parent.spacing
           anchors.verticalCenter: parent.verticalCenter
           spacing: Style.space(2)
+          visible: !row.editing
 
           Text {
             width: parent.width
@@ -938,12 +1160,68 @@ Panel {
         }
       }
 
+      // Row-level click: still toggles, but yields to edit/delete states.
+      // The action buttons below are non-hoverEnabled MouseAreas, so hover
+      // tracking (containsMouse) stays with this area even while the pointer
+      // is over them — actions stay visible and clickable.
       MouseArea {
         id: mouse
         anchors.fill: parent
         hoverEnabled: true
         cursorShape: Qt.PointingHandCursor
-        onClicked: root.toggleTask(modelData)
+        onClicked: {
+          if (row.editing) { row.editing = false; return }
+          if (row.armDelete) { row.armDelete = false; return }
+          root.toggleTask(modelData)
+        }
+        onExited: row.armDelete = false
+      }
+
+      TextField {
+        id: editField
+        visible: row.editing
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.leftMargin: Style.space(38) // row margin + checkbox + gap
+        anchors.rightMargin: Style.space(10)
+        anchors.verticalCenter: parent.verticalCenter
+        height: row.height - Style.space(6)
+        foreground: root.contentForeground
+        font.family: root.contentFontFamily
+        textFormat: Text.PlainText
+        onAccepted: row.commitEdit()
+      }
+
+      // Declared last = above the row MouseArea, so clicks land here.
+      Row {
+        id: actions
+        anchors.right: parent.right
+        anchors.rightMargin: Style.space(10)
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: Style.space(10)
+        visible: mouse.containsMouse && !row.editing
+
+        Text {
+          text: "✎"
+          color: root.contentForeground
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.body
+          MouseArea {
+            anchors.fill: parent
+            onClicked: row.startEdit()
+          }
+        }
+        Text {
+          text: row.armDelete ? "sure?" : "✕"
+          color: row.armDelete ? root.urgentColor : root.contentForeground
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.body
+          font.bold: row.armDelete
+          MouseArea {
+            anchors.fill: parent
+            onClicked: row.deleteClicked()
+          }
+        }
       }
     }
   }

@@ -163,6 +163,9 @@ is canonicalized (`~` expanded, trailing slashes removed) and must be absolute.
   set the vault path on first run.
 - **Filter chips** — narrow the list by source file or `#tag`; click the
   active chip again (or close the popup) to clear the filter.
+- **Hover** a task row: ✎ edits it inline (Enter saves, clicking away
+  cancels — the due date is prefilled so a plain edit keeps 📅); ✕ deletes
+  it on a second confirming click.
 - **Quick-add / agents** — append a task without opening the popup:
 
   ```bash
@@ -195,8 +198,8 @@ consume bounded resources.
 
 - `vaultPath` is canonicalized once with `realpath -e` (symlinks, `~` and
   relative components resolved) before anything derives paths from it.
-- Paths are only ever passed as **argv** to `find`/`stat`/`mv` — never
-  interpolated into a shell command — and task text is likewise argv-only.
+- Paths are only ever passed as **argv** to `find`/`stat` — never
+  interpolated into a shell command.
 
 **Discovery and reads**
 
@@ -206,21 +209,38 @@ consume bounded resources.
 - Every candidate is statted *before* a file view is created: `stat -c '%F:%s'`
   (no dereference) rejects symlinks, non-regular files, and anything over the
   **1 MiB** cap.
+- The file list is committed only after `find` exits *and* the stat queue has
+  drained; only candidates that passed their queued stat are published — raw
+  `find` output never reaches a view.
 - Watched-file reloads re-run the same gate; a failed check keeps the
   last-known-good content.
 
 **Writes (quick-add, checkboxes)**
 
-- Writes are atomic: `mktemp` (0600) → write → `mv -f` over the target
-  (`add-task.sh` is the fail-closed fallback used when the in-process path
-  isn't available).
+- Every write goes through a helper — `add-task.sh` (quick-add append),
+  `replace-line.sh` (checkbox toggle), `remove-line.sh` (delete) — as
+  `mktemp` (0600) → write → `mv -f` over the target, with the target's mode
+  re-applied *after* the rename. The staging file never leaves 0600 while it
+  is in `/tmp`, so a private note is never world-readable there. The in-process `FileView.setText()` path is deliberately
+  not used: Quickshell implements `atomicWrites` with `QSaveFile`, which
+  resolves an existing symlink before choosing the write target.
+- `replace-line.sh` compare-and-swaps: line *N* must still match what the
+  popup rendered, so an edit from a sync peer is refused, never overwritten.
+  `remove-line.sh` does the same for deletes (a concurrently edited line is
+  refused, not deleted).
+- Task text — quick-add input and the expected/replacement lines — travels
+  to the helpers on **stdin**, never in process arguments: argv is readable
+  by every local user via `/proc/<pid>/cmdline` (`ps`), a pipe by nobody but
+  the process itself. The reads are bounded (`read -t 10`), so a helper whose
+  caller died before writing exits instead of blocking forever.
 - A symlinked target is **refused**, never written through; the parent
   directory must be a real directory at rename time, so a swapped `Todos/`
   symlink can't redirect the write outside the vault.
 - The existing file's mode is preserved on replace.
-- Quick-add text is flattened to one line, whitespace-collapsed, capped at
-  `512` chars, and passed as argv only; the natural-language date conversion
-  is pure string work and cannot exceed the cap or introduce newlines.
+- Quick-add text is flattened to one line, whitespace-collapsed, and capped
+  at `512` chars before it reaches the write helpers (on stdin); the
+  natural-language date conversion is pure string work and cannot exceed
+  the cap or introduce newlines.
 
 **Rendering**
 
@@ -247,7 +267,9 @@ omarchy-todos/
 ├── manifest.json   # plugin metadata, settings schema
 ├── Model.js        # markdown parsing + path/stat validators (pure JS, node-testable)
 ├── Panel.qml       # bar widget + popup
-├── add-task.sh     # fail-closed atomic quick-add fallback (used by Panel.qml)
+├── add-task.sh     # fail-closed atomic quick-add write (used by Panel.qml)
+├── replace-line.sh # fail-closed compare-and-swap line write (Panel.qml)
+├── remove-line.sh  # fail-closed compare-and-swap line delete (Panel.qml)
 ├── test/           # model.test.js + adversarial vault-fixture.sh
 └── README.md
 ```
@@ -256,7 +278,7 @@ omarchy-todos/
 
 ```bash
 node test/model.test.js       # model unit tests (parsing, dates, filters, validators)
-bash test/vault-fixture.sh    # adversarial filesystem fixture (22 checks)
+bash test/vault-fixture.sh    # adversarial filesystem fixture (59 checks)
 ```
 
 To develop locally, clone a working copy into `~/.config/omarchy/plugins/`.
@@ -280,6 +302,13 @@ restart).
   `in 3 days` etc. converts to a `📅` tag (see [Markdown format](#markdown-format)).
 - **Filter chips** — narrow the popup by source file or `#tag`.
 - **Groups** — tasks are sectioned per file in the popup (see [Groups](#groups)).
+- **Inline edit and delete** — hover a task row to edit (✎) or delete (✕);
+  both are compare-and-swaps, so a concurrent edit from a sync peer is
+  refused, never overwritten.
+- **Write-path hardening** — every write (add/edit/delete/toggle) goes
+  through staged-rename helpers with the task text on stdin, never argv;
+  quick-adds are serialized; the staging file stays 0600 until rename;
+  the file list is published only after the stat queue drains.
 - Security: quick-add length cap now holds end-to-end; sync-peer filenames
   render as plain text in filter chips (rich-text injection fix); hostile
   filenames cannot forge grouping keys.

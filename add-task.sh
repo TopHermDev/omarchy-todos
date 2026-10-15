@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Atomic, symlink-safe task append used by the todos plugin's quick-add.
-# usage: add-task.sh <task-line> <target-file>
+# usage: add-task.sh <target-file>        (task line arrives on stdin, one line)
+#
+# The task text travels on STDIN, never in argv: argv lives in
+# /proc/<pid>/cmdline, which every local user can read (`ps`), so a task
+# line passed as an argument would be private-vault content on display.
 #
 # Why not `echo "$1" >> "$2"`? Shell redirection opens the target *through*
 # any symlink in every path component, so a planted inbox.md symlink (or a
@@ -13,17 +17,27 @@
 #   2. refuses if the target exists and is not a regular file (a planted
 #      inbox.md symlink is neither written through nor read through —
 #      equivalent to open(O_NOFOLLOW) failing with ELOOP)
-#   3. stages the new content in a temp file with the target's permissions
-#      and renames it over the target, so the write is atomic and the final
-#      object is always a regular file inside the vault
+#   3. stages the new content in a 0600 temp file and renames it over the
+#      target, then re-applies the target's mode AFTER the rename — a
+#      loosened staging file in /tmp would be cross-user readable before mv;
+#      the write is atomic and the final object always a regular file
+#      inside the vault
 #
 # Residual TOCTOU between the stat checks and the rename is accepted here;
-# the QML layer prefers FileView's atomicWrites path (no shell) when the
-# inbox view is already loaded.
+# the rename itself never follows a final-component symlink. There is no
+# in-process setText() alternative: Quickshell's atomicWrites uses QSaveFile,
+# which resolves an existing symlink before choosing the write target.
 set -u
 
-line=$1
-target=$2
+target=$1
+
+# One line from stdin (IFS= keeps leading/trailing spaces, -r keeps
+# backslashes; only the trailing newline is consumed). No stdin line at all
+# (closed channel, empty write) is refused. -t 10 bounds the wait: the QML
+# caller writes within milliseconds of process start, so a helper whose
+# caller died before writing exits instead of blocking forever.
+IFS= read -r -t 10 line || exit 1
+[ -n "$line" ] || exit 1
 
 tmp=$(mktemp "/tmp/.todos-XXXXXX") || exit 1
 
@@ -50,9 +64,16 @@ else
   printf '%s\n' "$line" > "$tmp" || { rm -f -- "$tmp"; exit 1; }
 fi
 
-# Keep the target's permission bits (mktemp creates 0600).
-if [ -e "$target" ]; then
-  chmod --reference="$target" -- "$tmp" 2>/dev/null || true
-fi
+# Capture the target's mode BEFORE the swap. The staging file must stay at
+# mktemp's 0600 until it is inside the vault: loosening it to (say) 0644
+# first would expose the whole note to other local accounts through the
+# world-searchable /tmp path in the window before mv. The mode is applied
+# AFTER the rename, where the vault's directory protection already covers
+# it. Fresh targets have no mode to copy and keep mktemp's 0600.
+mode=$(stat -c %a -- "$target" 2>/dev/null || true)
 
 mv -f -- "$tmp" "$target" || { rm -f -- "$tmp"; exit 1; }
+
+if [ -n "$mode" ]; then
+  chmod "$mode" -- "$target" 2>/dev/null || true
+fi
