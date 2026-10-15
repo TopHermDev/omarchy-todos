@@ -5,11 +5,12 @@ Obsidian markdown, kept in sync across machines with
 [Syncthing](https://syncthing.net/).
 
 Your todos are just `- [ ]` / `- [x]` lines in markdown files inside an
-Obsidian vault. The plugin watches those files, shows the open count in the
-bar, and lets you check tasks off from a popup. Because the source of truth is
-a folder on disk that Syncthing (or Dropbox, rsync, anything) keeps identical
-everywhere, every machine's bar shows the same list — no server, no API, no
-account.
+Obsidian vault. The plugin watches those files, shows the open count (with an
+overdue marker) in the bar, and lets you check tasks off from a popup that
+groups tasks per file and filters by file or `#tag`. Because the source of
+truth is a folder on disk that Syncthing (or Dropbox, rsync, anything) keeps
+identical everywhere, every machine's bar shows the same list — no server, no
+API, no account.
 
 ## How it works
 
@@ -100,6 +101,35 @@ checkbox syntax. Any `.md` file under `todosDir` is scanned:
 - `📅 YYYY-MM-DD` sets a due date (overdue items render red in the popup).
 - Tasks are grouped per file and sorted: open before done, overdue first.
 
+When quick-adding (popup or IPC), a trailing natural-language date is
+converted to a `📅` tag automatically:
+
+| You type                    | Becomes                          |
+| --------------------------- | -------------------------------- |
+| `water plants tomorrow`     | `water plants 📅 2026-10-16`     |
+| `ship report friday`        | `ship report 📅 2026-10-16`      |
+| `ship report next friday`   | `ship report 📅 2026-10-23`      |
+| `file report in 3 days`     | `file report 📅` + 3 days        |
+| `file report in 2 weeks`    | `file report 📅` + 14 days       |
+
+Weekdays roll forward — "friday" added on a Friday means next Friday, never
+today. An explicit `📅` in the text always wins; text that is nothing but a
+date word ("tomorrow") is stored verbatim.
+
+## Groups
+
+Every `.md` file in the todos folder is a group. Want separate lists for
+school and home?
+
+```bash
+touch ~/path/to/vault/Todos/school.md ~/path/to/vault/Todos/home.md
+```
+
+The popup shows one section per file (labeled by filename) whenever tasks
+span multiple files, and the file chips from the filter row double as
+one-click group views. Any file you add is picked up automatically — no
+configuration.
+
 ## Resource limits
 
 Because the vault is populated by sync tools, a peer could in principle drop
@@ -111,7 +141,9 @@ plugin bounds what it reads, watches, and parses:
   any content reaches the shell.
 - Each file is parsed for at most `10 000` lines / `1000` tasks (the `512 KB`
   parse cap remains as defense in depth).
-- A single task added via the bar or IPC is truncated to `2000` characters.
+- A single task added via the bar or IPC must fit in `512` characters after
+  sanitization (longer input is rejected, never partially written); a
+  natural-language date suffix is dropped rather than exceeding the cap.
 
 Tasks beyond those limits are simply not shown; the underlying files are never
 truncated or rewritten.
@@ -125,9 +157,12 @@ is canonicalized (`~` expanded, trailing slashes removed) and must be absolute.
 
 ## Usage
 
-- **Bar** — shows the open count; `✓` when all clear, `!` when unconfigured.
+- **Bar** — shows the open count (plus `·overdue` when any are overdue);
+  `✓` when all clear, `!` when unconfigured.
 - **Click** the widget to open the popup: check tasks off, add a new one, or
   set the vault path on first run.
+- **Filter chips** — narrow the list by source file or `#tag`; click the
+  active chip again (or close the popup) to clear the filter.
 - **Quick-add / agents** — append a task without opening the popup:
 
   ```bash
@@ -183,6 +218,18 @@ consume bounded resources.
   directory must be a real directory at rename time, so a swapped `Todos/`
   symlink can't redirect the write outside the vault.
 - The existing file's mode is preserved on replace.
+- Quick-add text is flattened to one line, whitespace-collapsed, capped at
+  `512` chars, and passed as argv only; the natural-language date conversion
+  is pure string work and cannot exceed the cap or introduce newlines.
+
+**Rendering**
+
+- Task text and filenames are attacker-influenced (a sync peer writes them),
+  so every `Text` that displays them forces `Text.PlainText` — QML's default
+  `AutoText` would otherwise promote an HTML-looking filename
+  (`<img …>.md`) to rich text.
+- Grouping/filter maps key on prefixed entries, so hostile filenames like
+  `__proto__` cannot forge object keys.
 
 **Limits and residual risk**
 
@@ -208,7 +255,7 @@ omarchy-todos/
 `Model.js` is Qt-free so it can be unit tested under node:
 
 ```bash
-node test/model.test.js       # validator unit tests
+node test/model.test.js       # model unit tests (parsing, dates, filters, validators)
 bash test/vault-fixture.sh    # adversarial filesystem fixture (22 checks)
 ```
 
@@ -221,6 +268,26 @@ restart).
 > `omarchy.*` namespace for first-party plugins). To rename it, change `id` in
 > `manifest.json` and the three matching places in `Panel.qml` (`moduleName`,
 > `ipcTarget`, and the `IpcHandler` `target`).
+
+## Changelog
+
+### Unreleased
+
+- **Due-date awareness in the bar** — overdue count shown as `N·overdue`,
+  tooltip shows overdue count and the next due date; the date rolls over at
+  midnight even in a long-running shell (and after suspend).
+- **Natural-language quick-add** — trailing `tomorrow` / `friday` /
+  `in 3 days` etc. converts to a `📅` tag (see [Markdown format](#markdown-format)).
+- **Filter chips** — narrow the popup by source file or `#tag`.
+- **Groups** — tasks are sectioned per file in the popup (see [Groups](#groups)).
+- Security: quick-add length cap now holds end-to-end; sync-peer filenames
+  render as plain text in filter chips (rich-text injection fix); hostile
+  filenames cannot forge grouping keys.
+
+### 1.0.0
+
+- Initial release: vault-backed todo bar widget with checkbox toggling,
+  quick-add IPC, due dates, and filesystem hardening.
 
 ## License
 

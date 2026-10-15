@@ -157,6 +157,155 @@ function isOverdue(due, today) {
   return due !== "" && due < today
 }
 
+// ---- natural-language due dates (quick-add) ----------------------------------
+// Matches a date expression at the END of the task text ("ship report
+// friday") and returns the stripped text plus the resolved 📅 date, or
+// null when the text carries no date. Deterministic: `today` is the
+// caller's dateKey, never read from the clock here.
+// Semantics (documented in README):
+//   today                  -> today
+//   tomorrow / tmrw        -> today + 1
+//   in N days / N weeks    -> today + N / N*7
+//   <weekday>              -> next occurrence strictly after today (1-7 days)
+//   next <weekday>         -> the occurrence after that (+7 more)
+// Text that already contains 📅, or that is nothing but a date word
+// ("remind me: tomorrow"), is left alone.
+var WEEKDAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+var NATURAL_DUE = /(?:^|\s)(next\s+)?(today|tomorrow|tmrw|in\s+\d{1,3}\s+(?:day|days|week|weeks)|sunday|monday|tuesday|wednesday|thursday|friday|saturday|sun|mon|tues|tue|weds|wed|thurs|thur|thu|fri|sat)\s*[.!?]?$/i
+
+function addDaysKey(today, n) {
+  var p = today.split("-")
+  var d = new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]) + n)
+  return dateKey(d)
+}
+
+function naturalDue(text, today) {
+  var s = String(text == null ? "" : text)
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(today == null ? "" : today))) return null
+  if (s.indexOf("📅") !== -1) return null
+  var m = NATURAL_DUE.exec(s)
+  if (!m) return null
+  var body = s.slice(0, m.index).replace(/\s+$/g, "")
+  if (body === "") return null
+  var hasNext = !!m[1]
+  var kw = m[2].toLowerCase().replace(/\s+/g, " ")
+  var due = ""
+  if (kw === "today") due = today
+  else if (kw === "tomorrow" || kw === "tmrw") due = addDaysKey(today, 1)
+  else if (kw.indexOf("in ") === 0) {
+    var im = /in\s+(\d{1,3})\s+(day|days|week|weeks)/.exec(kw)
+    due = addDaysKey(today, Number(im[1]) * (im[2].charAt(0) === "w" ? 7 : 1))
+  } else {
+    var name = { sun: "sunday", mon: "monday", tues: "tuesday", tue: "tuesday",
+                 weds: "wednesday", wed: "wednesday", thurs: "thursday",
+                 thur: "thursday", thu: "thursday", fri: "friday", sat: "saturday" }[kw] || kw
+    var target = WEEKDAYS.indexOf(name)
+    var delta = (target - new Date(Number(today.slice(0, 4)), Number(today.slice(5, 7)) - 1, Number(today.slice(8, 10))).getDay() + 7) % 7
+    if (delta === 0) delta = 7 // a plain weekday never means today
+    if (hasNext) delta += 7
+    due = addDaysKey(today, delta)
+  }
+  return { text: body, due: due }
+}
+
+// Full quick-add pipeline as one testable unit: flatten/cap the raw input,
+// convert a trailing natural-language date, then re-apply the length cap so
+// the INVARIANT holds — a task written to the vault never exceeds maxLen,
+// even after a date suffix is appended. Falls back to the undated text when
+// the date would push it over.
+function applyNaturalDue(text, today, maxLen) {
+  var t = sanitizeTaskText(text, maxLen)
+  if (t === null) return null
+  var nd = naturalDue(t, today)
+  if (nd !== null) {
+    var dated = nd.text + " 📅 " + nd.due
+    if (dated.length <= maxLen) return dated
+  }
+  return t
+}
+
+// ---- tags and filtering (popup) ----------------------------------------------
+// Obsidian-style #tags in task text: preceded by start-of-text or
+// whitespace, must begin with a letter (so "#123" and "url#frag" never
+// match), chars [A-Za-z0-9_-]. Returns unique tags, bounded.
+var MAX_TAGS = 32
+var TAG = /(?:^|\s)#([A-Za-z][A-Za-z0-9_-]*)/g
+
+function taskTags(text) {
+  var s = String(text == null ? "" : text)
+  var out = []
+  TAG.lastIndex = 0
+  var m
+  while ((m = TAG.exec(s)) !== null) {
+    if (out.indexOf(m[1]) === -1) {
+      out.push(m[1])
+      if (out.length >= MAX_TAGS) break
+    }
+  }
+  return out
+}
+
+// Pure filter over an already-built task list. kind: "all" | "file" | "tag".
+// "file" matches the task's source filename (with .md); "tag" matches a
+// #tag in the task text. Returns a new array; never mutates.
+function filterTasks(tasks, kind, value) {
+  var list = tasks || []
+  if (kind === "file") {
+    var v = String(value == null ? "" : value)
+    return list.filter(function (t) { return t && t.file === v })
+  }
+  if (kind === "tag") {
+    var tag = String(value == null ? "" : value)
+    if (tag === "") return list.slice()
+    return list.filter(function (t) { return t && taskTags(t.text).indexOf(tag) !== -1 })
+  }
+  return list.slice()
+}
+
+// Group a task list by source file for sectioned popup display: one entry
+// per file, tasks kept in the order given (already sorted overdue-first).
+// Group order = first appearance, so the file holding the most urgent task
+// leads. Label is the filename without .md ("school.md" -> "school").
+function groupByFile(tasks) {
+  var list = tasks || []
+  var keys = []
+  var byFile = {}
+  for (var i = 0; i < list.length; i++) {
+    var t = list[i]
+    if (!t) continue
+    var k = "f\u0001" + t.file // prefix guards against __proto__-style keys
+    if (byFile[k] === undefined) {
+      byFile[k] = []
+      keys.push(t.file)
+    }
+    byFile[k].push(t)
+  }
+  var out = []
+  for (var j = 0; j < keys.length; j++) {
+    out.push({ file: keys[j], label: keys[j].replace(/\.md$/, ""), tasks: byFile["f\u0001" + keys[j]] })
+  }
+  return out
+}
+
+// Summarize open tasks for the bar display: total open, how many are
+// overdue relative to `today` (a dateKey string), and the earliest due
+// date among open tasks that is not overdue ("" when none). Done tasks
+// are ignored entirely.
+function summarize(tasks, today) {
+  var open = 0
+  var overdue = 0
+  var nextDue = ""
+  var list = tasks || []
+  for (var i = 0; i < list.length; i++) {
+    var t = list[i]
+    if (!t || t.done) continue
+    open++
+    if (isOverdue(t.due, today)) overdue++
+    else if (t.due !== "" && (nextDue === "" || t.due < nextDue)) nextDue = t.due
+  }
+  return { open: open, overdue: overdue, nextDue: nextDue }
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     parseTasks: parseTasks,
@@ -169,6 +318,13 @@ if (typeof module !== "undefined") {
     sanitizeTaskText: sanitizeTaskText,
     dateKey: dateKey,
     isOverdue: isOverdue,
+    summarize: summarize,
+    naturalDue: naturalDue,
+    applyNaturalDue: applyNaturalDue,
+    taskTags: taskTags,
+    filterTasks: filterTasks,
+    groupByFile: groupByFile,
+    MAX_TAGS: MAX_TAGS,
     validateSegment: validateSegment,
     validateVaultPath: validateVaultPath,
     parseStatPayload: parseStatPayload,

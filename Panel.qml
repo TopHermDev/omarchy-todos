@@ -85,11 +85,19 @@ Panel {
     persistSettings({ vaultPath: path }) // rawVaultPath change re-canonicalizes
   }
 
+  function msUntilMidnight() {
+    var now = new Date()
+    var next = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1)
+    return Math.max(1000, next.getTime() - now.getTime())
+  }
+
   // ---- state ---------------------------------------------------------------
   readonly property color contentForeground: root.barForeground
   readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color urgentColor: bar && bar.urgent ? bar.urgent : Color.urgent
-  readonly property string todayKey: Model.dateKey(new Date())
+  // Refreshed when the day rolls over (see midnightTimer) and on refresh(),
+  // so a shell that stays running for days keeps correct overdue marking.
+  property string todayKey: Model.dateKey(new Date())
 
   property var files: []
   property var pendingFiles: []
@@ -97,6 +105,8 @@ Panel {
   property var taskList: []
   property var displayList: []
   property int openCount: 0
+  property int overdueCount: 0
+  property string nextDue: ""
   property var views: ({})
   property string filesKey: ""
   property bool scanAborted: false
@@ -107,13 +117,61 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  readonly property var openTasks: displayList.filter(function (t) { return !t.done })
-  readonly property var doneTasks: displayList.filter(function (t) { return t.done })
+  readonly property var openTasks: filteredList.filter(function (t) { return !t.done })
+  readonly property var doneTasks: filteredList.filter(function (t) { return t.done })
   readonly property int doneCount: doneTasks.length
+  // Sectioned display: one group per source file, most urgent file first.
+  readonly property var openGroups: Model.groupByFile(openTasks)
+  readonly property var doneGroups: Model.groupByFile(doneTasks)
+
+  // ---- filtering --------------------------------------------------------------
+  // filterKind: "all" | "file" | "tag"; filterValue is the filename (with
+  // .md) or the bare tag name. Reset to "all" when the popup closes so the
+  // next open always shows everything.
+  property string filterKind: "all"
+  property string filterValue: ""
+  readonly property var filteredList: Model.filterTasks(displayList, filterKind, filterValue)
+
+  // Chip model: "All" + every file that has tasks + every #tag in the
+  // current tasks. Bounded so a hostile vault cannot flood the popup with
+  // thousands of chips (files are already capped by maxFiles; tags by
+  // MAX_TAGS per task, and this cap covers the union).
+  readonly property var filterChips: buildFilterChips()
+  function buildFilterChips() {
+    var chips = [{ kind: "all", value: "", label: "All" }]
+    var seen = {}
+    var tagCount = 0
+    for (var i = 0; i < taskList.length; i++) {
+      var t = taskList[i]
+      if (seen["f\u0001" + t.file] !== true) {
+        seen["f\u0001" + t.file] = true
+        chips.push({ kind: "file", value: t.file, label: t.file.replace(/\.md$/, "") })
+      }
+      var tags = Model.taskTags(t.text)
+      for (var j = 0; j < tags.length; j++) {
+        if (seen["t\u0001" + tags[j]] !== true) {
+          seen["t\u0001" + tags[j]] = true
+          chips.push({ kind: "tag", value: tags[j], label: "#" + tags[j] })
+          if (++tagCount >= 24) break
+        }
+      }
+      if (tagCount >= 24 && chips.length >= 40) break
+    }
+    return chips
+  }
+  function setFilter(kind, value) {
+    // Clicking the active chip toggles back to "All".
+    if (filterKind === kind && filterValue === value) {
+      filterKind = "all"
+      filterValue = ""
+    } else {
+      filterKind = kind
+      filterValue = value
+    }
+  }
 
   function recompute() {
     var list = []
-    var open = 0
     var names = []
     for (var k in fileData) names.push(k)
     names.sort()
@@ -125,7 +183,6 @@ Panel {
       for (var j = 0; j < tasks.length; j++) {
         var t = tasks[j]
         list.push({ file: name, path: rec.path, line: t.line, done: t.done, text: t.text, due: t.due })
-        if (!t.done) open++
       }
     }
 
@@ -139,8 +196,11 @@ Panel {
       return a.file < b.file ? -1 : (a.file > b.file ? 1 : 0)
     })
 
+    var summary = Model.summarize(list, today)
     taskList = list
-    openCount = open
+    openCount = summary.open
+    overdueCount = summary.overdue
+    nextDue = summary.nextDue
     displayList = list.filter(function (t) { return root.showCompleted || !t.done })
   }
 
@@ -158,6 +218,12 @@ Panel {
     var next = {}
     for (var k in fileData) if (k !== name) next[k] = fileData[k]
     fileData = next
+    // A filter pointing at a vanished file would silently show nothing;
+    // drop back to "All" instead.
+    if (filterKind === "file" && filterValue === name) {
+      filterKind = "all"
+      filterValue = ""
+    }
     recompute()
   }
 
@@ -181,10 +247,19 @@ Panel {
     taskList = []
     displayList = []
     openCount = 0
+    overdueCount = 0
+    nextDue = ""
   }
 
   // ---- file discovery --------------------------------------------------------
   function refresh() {
+    // Any rescan is also a cheap opportunity to roll the date over without
+    // waiting for the midnight timer (e.g. after suspend across midnight).
+    var today = Model.dateKey(new Date())
+    if (today !== todayKey) {
+      todayKey = today
+      recompute()
+    }
     if (!root.configured || vaultPending || todosPath === "") {
       clearResults()
       return
@@ -293,9 +368,11 @@ Panel {
 
   function addTask(text) {
     // IPC/UI input is unbounded and can embed newlines (which would forge
-    // extra task lines in the file): flatten, collapse, and cap it first.
-    var t = Model.sanitizeTaskText(text, Model.MAX_TASK_LENGTH)
-    if (!root.configured || vaultPending || todosPath === "" || t === null) return
+    // extra task lines in the file): flatten, collapse, cap, and convert a
+    // trailing natural-language date in one step (see applyNaturalDue).
+    var t = Model.applyNaturalDue(text, root.todayKey, Model.MAX_TASK_LENGTH)
+    if (t === null) return
+    if (!root.configured || vaultPending || todosPath === "") return
     var line = "- [ ] " + t
     var path = todosPath + "/" + inboxFile
     // Preferred write path: no shell at all. appendTask + setText goes
@@ -304,8 +381,9 @@ Panel {
     // is passed through bash.
     var view = views[inboxFile]
     if (view && view.loaded) {
-      view.setText(Model.appendTask(String(view.text() || ""), t))
-      setFile(inboxFile, path, Model.appendTask(view && view.loaded ? String(view.text() || "") : "", t))
+      var next = Model.appendTask(String(view.text() || ""), t)
+      view.setText(next)
+      setFile(inboxFile, path, next) // next, not a re-append of view.text()
       return
     }
     // Fallback: symlink-safe staged rename via add-task.sh (see that file).
@@ -321,13 +399,16 @@ Panel {
   }
 
   readonly property string displayText: root.configured
-    ? (root.openCount > 0 ? String(root.openCount) : "✓")
+    ? (root.openCount > 0
+      ? String(root.openCount) + (root.overdueCount > 0 ? "·" + root.overdueCount : "")
+      : "✓")
     : "!"
 
   Component.onCompleted: normalizeVaultPath()
   onRawVaultPathChanged: normalizeVaultPath()
   onTodosPathChanged: refresh()
   onOpenedChanged: if (root.opened) refresh()
+                   else { filterKind = "all"; filterValue = "" }
 
   IpcHandler {
     target: "jeanhuit.todos"
@@ -455,6 +536,22 @@ Panel {
     stderr: StdioCollector { waitForEnd: true }
   }
 
+  // Day rollover: overdue marking depends on todayKey, and the shell lives
+  // for days. Fires at the next local midnight (recomputed after each fire
+  // to track DST), then recomputes so counts/tooltips roll over even when
+  // no file activity happens overnight.
+  Timer {
+    id: midnightTimer
+    repeat: false
+    interval: root.msUntilMidnight()
+    onTriggered: {
+      root.todayKey = Model.dateKey(new Date())
+      root.recompute()
+      interval = root.msUntilMidnight()
+      restart()
+    }
+  }
+
   // Watches the Todos directory itself; "" while unconfigured/vaultPending
   // unloads it, so nothing is watched before the path is canonical.
   // onFileChanged is coalesced through a debounce timer: an event storm
@@ -498,7 +595,11 @@ Panel {
     bar: root.bar
     text: root.displayText
     tooltipText: root.configured
-      ? (root.openCount + " open todo" + (root.openCount === 1 ? "" : "s"))
+      ? (root.openCount === 0
+        ? "All todos done"
+        : root.openCount + " open todo" + (root.openCount === 1 ? "" : "s")
+          + (root.overdueCount > 0 ? ", " + root.overdueCount + " overdue" : "")
+          + (root.nextDue !== "" ? " — next 📅 " + root.nextDue : ""))
       : "Click to set your Obsidian vault"
     horizontalMargin: 8.75
     verticalPadding: 8.75
@@ -551,7 +652,7 @@ Panel {
           TextField {
             id: quickField
             width: parent.width - addButton.width - parent.spacing
-            placeholderText: "Add a todo…"
+            placeholderText: "Add a todo… (e.g. buy milk tomorrow)"
             foreground: root.contentForeground
             font.family: root.contentFontFamily
             onAccepted: root.submitQuick()
@@ -620,16 +721,90 @@ Panel {
           wrapMode: Text.WordWrap
         }
 
+        // Filter chips: All + one per file + one per #tag. Hidden when
+        // there is nothing to filter (single "All" chip only).
+        Flow {
+          id: chipFlow
+          width: parent.width
+          visible: root.configured && root.filterChips.length > 1
+          spacing: Style.space(6)
+
+          Repeater {
+            model: root.filterChips
+            delegate: BorderSurface {
+              id: chip
+              required property var modelData
+              readonly property bool active: root.filterKind === modelData.kind
+                                             && (modelData.kind === "all" || root.filterValue === modelData.value)
+              height: chipText.implicitHeight + Style.space(10)
+              width: chipText.implicitWidth + Style.space(20)
+              radius: Style.cornerRadius
+              color: chipMouse.containsMouse
+                ? Style.hoverFillFor(root.contentForeground, Color.accent)
+                : (active ? Style.selectedFillFor(root.contentForeground, Color.accent) : "transparent")
+              borderSpec: active
+                ? Border.controlSpec("selected", root.contentForeground, Color.accent)
+                : (chipMouse.containsMouse
+                  ? Border.controlSpec("hover-cursor", root.contentForeground, Color.accent)
+                  : Border.controlSpec("normal", root.contentForeground, Color.accent))
+
+              Text {
+                id: chipText
+                anchors.centerIn: parent
+                // PlainText is mandatory: labels derive from filenames a
+                // sync peer controls, and AutoText would render HTML in
+                // them (rich-text injection from a planted <img>/<b> name).
+                textFormat: Text.PlainText
+                text: chip.modelData.label
+                color: active
+                  ? Style.selectedStateColor(root.contentForeground, Color.accent)
+                  : root.contentForeground
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: active
+              }
+
+              MouseArea {
+                id: chipMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.setFilter(chip.modelData.kind, chip.modelData.value)
+              }
+            }
+          }
+        }
+
         PanelSectionHeader {
           visible: root.configured && root.openTasks.length > 0
-          text: "Open"
+          text: root.filterKind === "all"
+            ? "Open"
+            : "Open — " + (root.filterKind === "file" ? root.filterValue.replace(/\.md$/, "") : "#" + root.filterValue)
           foreground: root.contentForeground
           fontFamily: root.contentFontFamily
         }
 
+        // Open tasks, sectioned per source file. The per-file sub-header
+        // only appears when tasks actually span multiple files — a single
+        // file's tasks don't need a redundant label.
         Repeater {
-          model: root.openTasks
-          delegate: taskRow
+          model: root.openGroups
+          delegate: Column {
+            width: column.width
+            spacing: Style.space(2)
+
+            PanelSectionHeader {
+              visible: root.openGroups.length > 1
+              text: modelData.label
+              foreground: root.contentForeground
+              fontFamily: root.contentFontFamily
+            }
+
+            Repeater {
+              model: modelData.tasks
+              delegate: taskRow
+            }
+          }
         }
 
         PanelSectionHeader {
@@ -640,14 +815,38 @@ Panel {
         }
 
         Repeater {
-          model: root.doneTasks
-          delegate: taskRow
+          model: root.doneGroups
+          delegate: Column {
+            width: column.width
+            spacing: Style.space(2)
+
+            PanelSectionHeader {
+              visible: root.doneGroups.length > 1
+              text: modelData.label
+              foreground: root.contentForeground
+              fontFamily: root.contentFontFamily
+            }
+
+            Repeater {
+              model: modelData.tasks
+              delegate: taskRow
+            }
+          }
         }
 
         Text {
           width: parent.width
           visible: root.configured && root.displayList.length === 0
           text: "All clear."
+          color: Qt.darker(root.contentForeground, 1.6)
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.body
+        }
+
+        Text {
+          width: parent.width
+          visible: root.configured && root.displayList.length > 0 && root.filteredList.length === 0
+          text: "No tasks match this filter."
           color: Qt.darker(root.contentForeground, 1.6)
           font.family: root.contentFontFamily
           font.pixelSize: Style.font.body
