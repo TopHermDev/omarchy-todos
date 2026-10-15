@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "jeanhuit.todos",
   "name": "Synced Todos",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "jeanhuit",
   "license": "MIT",
   "description": "Obsidian-tasks todo list backed by markdown in a Syncthing-synced Obsidian vault.",

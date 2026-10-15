@@ -271,7 +271,7 @@ restart).
 
 ## Changelog
 
-### Unreleased
+### 1.1.0
 
 - **Due-date awareness in the bar** — overdue count shown as `N·overdue`,
   tooltip shows overdue count and the next due date; the date rolls over at
