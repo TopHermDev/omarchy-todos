@@ -1188,7 +1188,6 @@ Panel {
         height: row.height - Style.space(6)
         foreground: root.contentForeground
         font.family: root.contentFontFamily
-        textFormat: Text.PlainText
         onAccepted: row.commitEdit()
       }
 
