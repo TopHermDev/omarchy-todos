@@ -643,7 +643,7 @@ Panel {
     property string pendingInput: ""
     function run(line, path) {
       pendingInput = line + "\n"
-      command = ["bash", Qt.resolvedUrl("add-task.sh").replace("file://", ""), path]
+      command = ["bash", String(Qt.resolvedUrl("add-task.sh")).replace("file://", ""), path]
       running = true
     }
     onRunningChanged: {
@@ -677,7 +677,7 @@ Panel {
     property string content: ""
     function run(target, lineno, expected, replacement) {
       pendingInput = expected + "\n" + replacement + "\n"
-      command = ["bash", Qt.resolvedUrl("replace-line.sh").replace("file://", ""), target, String(lineno)]
+      command = ["bash", String(Qt.resolvedUrl("replace-line.sh")).replace("file://", ""), target, String(lineno)]
       running = true
     }
     onRunningChanged: {
@@ -711,7 +711,7 @@ Panel {
     property string path: ""
     function run(target, lineno, expected) {
       pendingInput = expected + "\n"
-      command = ["bash", Qt.resolvedUrl("remove-line.sh").replace("file://", ""), target, String(lineno)]
+      command = ["bash", String(Qt.resolvedUrl("remove-line.sh")).replace("file://", ""), target, String(lineno)]
       running = true
     }
     onRunningChanged: {
